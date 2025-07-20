@@ -18,7 +18,7 @@ i=0
 
 # Function to get free space in MB on the current filesystem
 get_free_mb() {
-    df -Pm . | awk 'NR==2 {print $4}'
+    df -Pm "$dir" | awk 'NR==2 {print $4}'
 }
 
 echo "How much free space (in MB) do you want to leave on disk?"
