@@ -59,14 +59,16 @@ detect_connection_type() {
             # Most modern Kindles have "Internal Storage" directory
             if gio list "$mtp_uri" 2>/dev/null | grep -q "Internal Storage"; then
                 KINDLE_PATH="$mtp_uri/Internal Storage"
-                # Set GVFS local path as fallback for more reliable file operations
-                local gvfs_path="/run/user/$(id -u)/gvfs/mtp:host=Amazon_Kindle_Colorsoft_Signature_Edition_GN43H706520300J2/Internal Storage"
+                # Extract device name from URI for GVFS path
+                local device_name=$(echo "$mtp_uri" | sed 's|mtp://||')
+                local gvfs_path="/run/user/$(id -u)/gvfs/mtp:host=${device_name}/Internal Storage"
                 if [ -d "$gvfs_path" ]; then
                     KINDLE_LOCAL_PATH="$gvfs_path"
                 fi
             else
                 KINDLE_PATH="$mtp_uri"
-                local gvfs_path="/run/user/$(id -u)/gvfs/mtp:host=Amazon_Kindle_Colorsoft_Signature_Edition_GN43H706520300J2"
+                local device_name=$(echo "$mtp_uri" | sed 's|mtp://||')
+                local gvfs_path="/run/user/$(id -u)/gvfs/mtp:host=${device_name}"
                 if [ -d "$gvfs_path" ]; then
                     KINDLE_LOCAL_PATH="$gvfs_path"
                 fi
@@ -116,7 +118,12 @@ create_kindle_directory() {
     case "$CONNECTION_TYPE" in
         "mass_storage")
             # Simple directory creation for mounted filesystems
-            mkdir -p "$KINDLE_PATH/$dir_name"
+            echo "Creating directory $dir_name on Kindle..."
+            if mkdir -p "$KINDLE_PATH/$dir_name" 2>/dev/null; then
+                echo "✓ Directory created successfully"
+            else
+                echo "⚠ Warning: Could not create directory, but continuing..."
+            fi
             ;;
         "mtp")
             # MTP devices require special handling with multiple fallback methods
@@ -257,15 +264,26 @@ esac
 
 echo "Filling Kindle disk with files. Please wait..."
 while true; do
-    freeMB=$(get_free_mb)
+    # Get free space with error handling
+    freeMB=$(get_free_mb 2>/dev/null) || {
+        echo "Error: Could not get free space information"
+        break
+    }
+    
+    # Validate that we got a numeric value
+    if ! [[ "$freeMB" =~ ^[0-9]+$ ]]; then
+        echo "Error: Invalid free space value: $freeMB"
+        break
+    fi
     
     # Determine optimal file size based on available space
-    if [ "$freeMB" -ge 1024 ]; then
-        fileSize=1G
-        fileLabel="1GB"
-    elif [ "$freeMB" -ge 100 ]; then
+    # Use smaller files for better compatibility with slow USB devices
+    if [ "$freeMB" -ge 500 ]; then
         fileSize=100M
         fileLabel="100MB"
+    elif [ "$freeMB" -ge 100 ]; then
+        fileSize=50M
+        fileLabel="50MB"
     elif [ "$freeMB" -ge "$minFreeMB" ]; then
         fileSize=10M
         fileLabel="10MB"
@@ -278,21 +296,26 @@ while true; do
         break
     fi
 
+    echo "Creating file of size $fileLabel (Free space: ${freeMB}MB)..."
+
     # Create file locally first (efficient and doesn't consume Kindle space if transfer fails)
     local_file="$TEMP_DIR/file_$i"
-    dd if=/dev/zero of="$local_file" bs=$fileSize count=1 status=none 2>/dev/null
+    if ! dd if=/dev/zero of="$local_file" bs=$fileSize count=1 status=none 2>/dev/null; then
+        echo "Error creating temporary file"
+        break
+    fi
     
     if [ ! -f "$local_file" ]; then
-        echo "Error creating temporary file"
+        echo "Error: Temporary file not created"
         break
     fi
 
     # Transfer file to Kindle using appropriate method
     kindle_dest="$dir/file_$i"
     if copy_to_kindle "$local_file" "$kindle_dest"; then
-        echo "Transferred file_$i of size $fileLabel to Kindle. Remaining free space: $freeMB MB"
+        echo "✓ Transferred file_$i of size $fileLabel to Kindle"
     else
-        echo "Error transferring file_$i to Kindle"
+        echo "✗ Error transferring file_$i to Kindle"
         rm -f "$local_file"
         break
     fi
@@ -300,6 +323,9 @@ while true; do
     # Clean up local file immediately after successful transfer
     rm -f "$local_file"
     i=$((i+1))
+    
+    # Add small delay to prevent overwhelming the system
+    sleep 0.5
 done
 
 echo "Space exhausted or less than $minFreeMB MB free after transferring $i files to Kindle."
