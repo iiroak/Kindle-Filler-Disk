@@ -1,3 +1,6 @@
+> [!IMPORTANT]  
+> If you have a newer kindle (Firmware >5.16.3) than this script will not work because now MTP is used when connecting to a computer. Instead, extract one of the [MTP Files](/mtp) to a desired location on your Kindle.
+
 # Kindle Disk Filler Utility
 
 This utility helps fill up the storage space on your Kindle (or any device) to prevent automatic updates, especially useful for jailbreak preparation. It is available for Windows (PowerShell) and Linux/macOS (Bash).
