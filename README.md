@@ -1,5 +1,5 @@
 > [!IMPORTANT]  
-> If you have a newer kindle (Firmware >5.16.3) than this script will not work because now MTP is used when connecting to a computer. Instead, extract one of the [MTP Files](/mtp) to a desired location on your Kindle.
+> If you have a newer kindle (Firmware >5.16.3) than this script will not work because now MTP is used when connecting to a computer. Instead, extract one of the [MTP Files](/MTP) to a desired location on your Kindle.
 
 # Kindle Disk Filler Utility
 
