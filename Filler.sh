@@ -16,6 +16,9 @@ dir="fill_disk"
 mkdir -p "$dir"
 i=0
 
+GREEN='\033[0;32m'
+NC='\033[0m'
+
 # Function to get free space in MB on the current filesystem
 get_free_mb() {
     df -Pm $dir | awk 'NR==2 {print $4}'
@@ -42,20 +45,22 @@ TOTAL_UNITS=100          # keep at 100 if you want a 0‑100 % bar
 
 draw_bar () {
     local add=$1
-    (( add == 0 )) && return          # ignore no‑progress calls
+    (( add == 0 )) && return 
 
     PROGRESS=$(( PROGRESS + add ))
-    (( PROGRESS > TOTAL_UNITS )) && PROGRESS=$TOTAL_UNITS   # clamp
+    (( PROGRESS > TOTAL_UNITS )) && PROGRESS=$TOTAL_UNITS 
 
-    local pct=$(( PROGRESS * 100 / TOTAL_UNITS ))   # integer percent
-    local filled=$(( pct / 2 ))                     # 50‑char bar (2 % each)
+    local pct=$(( PROGRESS * 100 / TOTAL_UNITS ))
+    local filled=$(( pct / 2 ))
+    local empty=$(( 50 - filled ))
 
-    # build the bar without external commands for better compatibility
-    printf -v bar '%*s' "$filled" ''
-    bar=${bar// /#}
+    printf -v fill_str '%*s' "$filled" ''
+    fill_str=${fill_str//#} # If filled is 0, this might act weird, see below
 
-    printf '\r[%-50s] %3d%%' "$bar" "$pct"
-    printf '\n'
+    fill_str=$(printf "%${filled}s" | tr ' ' '#')
+    empty_str=$(printf "%${empty}s" | tr ' ' '-')
+
+    printf "\rProgress: [%b%s%b%s] %d%%" "$GREEN" "$fill_str" "$NC" "$empty_str" "$pct"
 }
 
 echo "How much free space (in MB) do you want to leave on disk?"
