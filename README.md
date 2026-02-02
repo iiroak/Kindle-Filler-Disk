@@ -2,9 +2,30 @@
 
 This utility helps fill up the storage space on your Kindle (or any device) to prevent automatic updates, especially useful for jailbreak preparation. It is available for Windows (PowerShell) and Linux/macOS (Bash).
 
-**Important:** Copy the script (`Filler.ps1` or `Filler.sh`) to the root directory of your Kindle when it is connected via USB. The root directory is the main folder you see when you open the Kindle drive on your computer (not inside any subfolder).
+**Important:** Older Kindles expose a normal USB drive (USB mass storage) and you can run the script *from that mounted drive*.
+Newer Kindles (including **Kindle Paperwhite 12th gen**) use **MTP** (no mounted drive letter on Windows / no `/Volumes/Kindle` on macOS), so you must generate the filler files locally and copy them with an MTP tool like **OpenMTP**.
 
 ## Usage
+
+## Kindle Paperwhite 12th gen (MTP) on macOS: OpenMTP workflow
+
+1. Install OpenMTP (macOS):
+   - Repo: `https://github.com/ganeshrvel/openmtp`
+2. Connect your Kindle over USB and open OpenMTP.
+3. In OpenMTP, select your Kindle and note the **free space** it shows (in MB).
+4. In this repo, run:
+
+```bash
+chmod +x Filler.sh
+./Filler.sh --mtp
+```
+
+5. The script will create a local folder named `fill_disk/` (or your `--payload-dir`) sized to reduce the Kindle’s free space down to your chosen “leave MB”.
+6. In OpenMTP, copy the generated `fill_disk/` folder onto the Kindle (recommended destination: `documents/`).
+
+### Alternative (MTP): use prebuilt payload zips
+
+If you prefer not to generate files, there are prebuilt payload zips in `MTP/` (e.g. `MTP/fill_32gb.zip`). Unzip one locally and copy the extracted folder(s) to the Kindle using OpenMTP. If copying stops due to “out of space”, that’s expected—re-run with the updated free space if you want to get closer to 20–50MB remaining.
 
 ### Windows (PowerShell)
 **Tip:** To quickly open a PowerShell window in the correct folder:
