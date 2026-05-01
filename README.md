@@ -14,6 +14,11 @@ curl -fsSL https://github.com/iiroak/Kindle-Filler-Disk/raw/main/NoMTP/Filler.sh
 irm https://github.com/iiroak/Kindle-Filler-Disk/raw/main/NoMTP/Filler.ps1 | iex
 ```
 
+**Windows (CMD):**
+```cmd
+powershell -Command "irm https://github.com/iiroak/Kindle-Filler-Disk/raw/main/NoMTP/Filler.ps1 | iex"
+```
+
 ## Notes
 
 - Recommended free space: 20-50 MB to block updates

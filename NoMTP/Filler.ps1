@@ -1,5 +1,5 @@
 # Kindle Disk Filler Utility for Windows/PowerShell
-# Author: iroak (https://github.com/bastianmarin)
+# Author: iroak (https://github.com/iiroak)
 
 Write-Host "--------------------------------------------------------------------"
 Write-Host "|                    Kindle Disk Filler Utility                    |"

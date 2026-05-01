@@ -1,6 +1,6 @@
 #!/bin/bash
 # Kindle Disk Filler Utility for Linux/macOS
-# Author: iroak (https://github.com/bastianmarin)
+# Author: iroak (https://github.com/iiroak)
 # This tool fills the disk to prevent automatic updates on tablets
 # that have not been registered. Useful for jailbreak preparation.
 
