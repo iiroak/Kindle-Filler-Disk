@@ -1,11 +1,14 @@
 # Kindle Disk Filler Utility for Windows/PowerShell
-# Author: iroak (https://github.com/iiroak)
+# Author: iiroak (https://github.com/iiroak)
 
-Write-Host "--------------------------------------------------------------------"
-Write-Host "|                    Kindle Disk Filler Utility                    |"
-Write-Host "| This tool fills the disk to prevent automatic updates on tablets |"
-Write-Host "| that have not been registered. Useful for jailbreak preparation. |"
-Write-Host "--------------------------------------------------------------------"
+Write-Host ""
+Write-Host "  +=============================================================+"
+Write-Host "  |               Kindle Disk Filler Utility v2.0               |"
+Write-Host "  +=============================================================+"
+Write-Host "  |     Fills disk to prevent auto-updates on unregistered      |"
+Write-Host "  |         tablets. Useful for jailbreak preparation.          |"
+Write-Host "  +=============================================================+"
+Write-Host ""
 
 $dir = "fill_disk"
 if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir | Out-Null }
@@ -20,8 +23,6 @@ function Find-NextFreeIndex {
         $index++
     }
 }
-
-$i = Find-NextFreeIndex
 
 function Get-FreeBytes {
     $drive = (Get-Location).Path.Substring(0,2)
@@ -39,56 +40,115 @@ function Get-PrettyFileSize($size) {
     return "{0:N1} {1}" -f $size, $suffix[$index]
 }
 
-Write-Host "How much free space (in MB) do you want to leave on disk?"
-Write-Host "It is highly recommended to leave only 20-50 MB of free space (no more) to prevent updates."
-Write-Host "[1] 20 MB (default)"
-Write-Host "[2] 50 MB"
-Write-Host "[3] 100 MB"
-Write-Host "[4] Custom value"
-$choice = Read-Host "Enter your choice (1-4) [1]"
+function Draw-Bar {
+    param([int]$Percent, [int]$Total = 50)
+    $filled = [math]::Floor($Percent * $Total / 100)
+    $empty = $Total - $filled
+    $bar = "=" * $filled + "-" * $empty
+    return $bar
+}
 
-switch ($choice) {
-    '2' { $minFreeMB = 50 }
-    '3' { $minFreeMB = 100 }
-    '4' {
-        $custom = Read-Host "Enter the minimum free space in MB (e.g., 30)"
-        if ([int]::TryParse($custom, [ref]$null) -and $custom -gt 0) {
-            $minFreeMB = [int]$custom
-        } else {
-            Write-Host "Invalid input. Using default (20 MB)."
-            $minFreeMB = 20
-        }
+function Write-ProgressLine {
+    param(
+        [int]$Percent,
+        [string]$Status,
+        [string]$Detail
+    )
+
+    $bar = Draw-Bar -Percent $Percent -Total 32
+    $line = "  [{0}] {1,3}%  {2}{3}" -f $bar, $Percent, $Status, $Detail
+    $width = [Math]::Max([Console]::WindowWidth - 1, $line.Length)
+    [Console]::Write(("`r{0}" -f $line.PadRight($width)))
+}
+
+Write-Host "How much free space (in MB) do you want to leave on disk?"
+Write-Host "It is highly recommended to leave only 20-50 MB (no more) to prevent updates."
+Write-Host ""
+Write-Host "  [1] 20 MB (default)"
+Write-Host "  [2] 50 MB"
+Write-Host "  [3] 100 MB"
+Write-Host "  [4] Custom value"
+Write-Host ""
+$choice = Read-Host "  Enter your choice (1-4) [1]"
+
+if ($choice -eq "2") {
+    $minFreeMB = 50
+} elseif ($choice -eq "3") {
+    $minFreeMB = 100
+} elseif ($choice -eq "4") {
+    $custom = Read-Host "  Enter the minimum free space in MB (e.g., 30)"
+    $customValue = 0
+    if ([int]::TryParse($custom, [ref]$customValue) -and $customValue -gt 0) {
+        $minFreeMB = $customValue
+    } else {
+        Write-Host "Invalid input. Using default (20 MB)."
+        $minFreeMB = 20
     }
-    default { $minFreeMB = 20 }
+} else {
+    $minFreeMB = 20
 }
 
 $expectedFreeSize = $minFreeMB * 1MB
 $maxFileSize = 1GB
 
-Write-Host "Filling disk with files. Please wait..."
+Write-Host ""
+Write-Host "[>] Starting disk fill process..."
+Write-Host ""
+
+$i = Find-NextFreeIndex
+$totalFreeBytes = (Get-FreeBytes)
+$targetFillBytes = $totalFreeBytes - $expectedFreeSize
+
+if ($targetFillBytes -le 0) {
+    Write-Host "[!] The requested free space is greater than or equal to the current free space. Nothing to do."
+    Write-Host ""
+    Read-Host "Press Enter to exit"
+    exit
+}
+
 while ($true) {
-    $freeBytes = (Get-FreeBytes) - $expectedFreeSize
+    $fillableBytes = (Get-FreeBytes) - $expectedFreeSize
+    if ($fillableBytes -le 0) { break }
+
     $fileSize = $maxFileSize
-    if ($freeBytes -lt $maxFileSize) {
-        $fileSize = $freeBytes
+    if ($fillableBytes -lt $maxFileSize) {
+        $fileSize = $fillableBytes
     }
 
-    if ($fileSize -le $expectedFreeSize) { break }
+    if ($fileSize -le 0) { break }
 
     $fileLabel = Get-PrettyFileSize $fileSize
     $filePath = Join-Path $dir "file_$i"
-    Write-Host ("Creating file_$i of size $fileLabel...")
+
+    $currentFree = Get-FreeBytes
+    $usedBytes = $totalFreeBytes - $currentFree
+    $percent = [math]::Floor(($usedBytes * 100) / $targetFillBytes)
+    if ($percent -lt 0) { $percent = 0 }
+    if ($percent -gt 100) { $percent = 100 }
+
+    Write-ProgressLine -Percent $percent -Status "Creating: " -Detail "file_$i ($fileLabel)"
+
     fsutil file createnew $filePath $fileSize | Out-Null
+
     if (-not (Test-Path $filePath)) { break }
-    $freeBytes = Get-FreeBytes
-    $freeBytesLabel = Get-PrettyFileSize $freeBytes
-    Write-Host ("Created file_$i of size $fileLabel. Remaining free space: $freeBytesLabel")
+
     $i = Find-NextFreeIndex
+
+    $currentFree = Get-FreeBytes
+    $remainingLabel = Get-PrettyFileSize $currentFree
+    $usedBytes = $totalFreeBytes - $currentFree
+    $percent = [math]::Floor(($usedBytes * 100) / $targetFillBytes)
+    if ($percent -lt 0) { $percent = 0 }
+    if ($percent -gt 100) { $percent = 100 }
+
+    Write-ProgressLine -Percent $percent -Status "Done:     " -Detail "file_$($i - 1) | Free: $remainingLabel"
 }
 
-$freeBytes = Get-FreeBytes
-$freeBytesLabel = Get-PrettyFileSize $freeBytes
-
-Write-Host "Done filling up the disk. $freeBytesLabel free after creating $i files in $dir."
-Write-Host "You can now check the $dir folder. Press any key to exit."
-Pause
+Write-Host ""
+Write-Host "  +---------------------------------------------------------+"
+Write-Host "  |  Disk fill complete!                                      |"
+Write-Host "  |  Files created: $i"
+Write-Host "  |  Target directory: $dir"
+Write-Host "  +---------------------------------------------------------+"
+Write-Host ""
+Read-Host "Press Enter to exit"
