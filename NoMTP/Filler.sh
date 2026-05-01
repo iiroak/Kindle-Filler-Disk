@@ -15,7 +15,6 @@ echo "--------------------------------------------------------------------"
 dir="fill_disk"
 mkdir -p "$dir"
 
-# Finds the next free index for a file in the specified directory
 find_next_free_index() {
     local index=0
     while true; do
@@ -27,7 +26,6 @@ find_next_free_index() {
     done
 }
 
-# Function to get free space in MB on the current filesystem
 get_free_mb() {
     df -Pm $dir | awk 'NR==2 {print $4}'
 }
@@ -35,33 +33,29 @@ get_free_mb() {
 create_file () {
     local size=$1 path=$2
 
-    # Linux on ext4/xfs/btrfs → *instant* allocation
     if command -v fallocate >/dev/null 2>&1; then
         fallocate -l "$size" "$path"  && return
     fi
-    # macOS
     if command -v mkfile    >/dev/null 2>&1; then
         mkfile "$size" "$path"        && return
     fi
 
-    # Portable but very slow ;(
     dd if=/dev/zero of="$path" bs="$size" count=1 status=none
 }
 
 PROGRESS=0
-TOTAL_UNITS=100          # keep at 100 if you want a 0‑100 % bar
+TOTAL_UNITS=100
 
 draw_bar () {
     local add=$1
-    (( add == 0 )) && return          # ignore no‑progress calls
+    (( add == 0 )) && return
 
     PROGRESS=$(( PROGRESS + add ))
-    (( PROGRESS > TOTAL_UNITS )) && PROGRESS=$TOTAL_UNITS   # clamp
+    (( PROGRESS > TOTAL_UNITS )) && PROGRESS=$TOTAL_UNITS
 
-    local pct=$(( PROGRESS * 100 / TOTAL_UNITS ))   # integer percent
-    local filled=$(( pct / 2 ))                     # 50‑char bar (2 % each)
+    local pct=$(( PROGRESS * 100 / TOTAL_UNITS ))
+    local filled=$(( pct / 2 ))
 
-    # build the bar without external commands for better compatibility
     printf -v bar '%*s' "$filled" ''
     bar=${bar// /#}
 
