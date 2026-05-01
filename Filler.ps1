@@ -10,7 +10,6 @@ Write-Host "--------------------------------------------------------------------
 $dir = "fill_disk"
 if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir | Out-Null }
 
-# Function to find the next free index for a file in the specified directory.
 function Find-NextFreeIndex {
     $index = 0
     while ($true) {
@@ -30,7 +29,16 @@ function Get-FreeBytes {
     return $free
 }
 
-# Menu for user to select free space to leave
+function Get-PrettyFileSize($size) {
+    $suffix = "B", "KB", "MB", "GB", "TB"
+    $index = 0
+    while ($size -ge 1KB) {
+        $size = $size / 1KB
+        $index++
+    }
+    return "{0:N1} {1}" -f $size, $suffix[$index]
+}
+
 Write-Host "How much free space (in MB) do you want to leave on disk?"
 Write-Host "It is highly recommended to leave only 20-50 MB of free space (no more) to prevent updates."
 Write-Host "[1] 20 MB (default)"
@@ -54,34 +62,33 @@ switch ($choice) {
     default { $minFreeMB = 20 }
 }
 
+$expectedFreeSize = $minFreeMB * 1MB
+$maxFileSize = 1GB
+
 Write-Host "Filling disk with files. Please wait..."
 while ($true) {
-    $freeBytes = Get-FreeBytes
-    $freeMB = [math]::Floor($freeBytes / 1MB)
-    $freeGB = [math]::Floor($freeBytes / 1GB)
-
-    if ($freeGB -ge 1) {
-        $fileSize = 1GB
-        $fileLabel = "1GB"
-    } elseif ($freeMB -ge 100) {
-        $fileSize = 100MB
-        $fileLabel = "100MB"
-    } elseif ($freeMB -ge $minFreeMB) {
-        $fileSize = 10MB
-        $fileLabel = "10MB"
-    } else {
-        break
+    $freeBytes = (Get-FreeBytes) - $expectedFreeSize
+    $fileSize = $maxFileSize
+    if ($freeBytes -lt $maxFileSize) {
+        $fileSize = $freeBytes
     }
 
-    if ($freeMB -lt $minFreeMB) { break }
+    if ($fileSize -le $expectedFreeSize) { break }
 
+    $fileLabel = Get-PrettyFileSize $fileSize
     $filePath = Join-Path $dir "file_$i"
+    Write-Host ("Creating file_$i of size $fileLabel...")
     fsutil file createnew $filePath $fileSize | Out-Null
     if (-not (Test-Path $filePath)) { break }
-    Write-Host ("Created file_$i of size $fileLabel. Remaining free space: {0} MB" -f $freeMB)
+    $freeBytes = Get-FreeBytes
+    $freeBytesLabel = Get-PrettyFileSize $freeBytes
+    Write-Host ("Created file_$i of size $fileLabel. Remaining free space: $freeBytesLabel")
     $i = Find-NextFreeIndex
 }
 
-Write-Host "Space exhausted or less than $minFreeMB MB free after creating $i files in $dir."
+$freeBytes = Get-FreeBytes
+$freeBytesLabel = Get-PrettyFileSize $freeBytes
+
+Write-Host "Done filling up the disk. $freeBytesLabel free after creating $i files in $dir."
 Write-Host "You can now check the $dir folder. Press any key to exit."
 Pause
