@@ -49,7 +49,7 @@ create_file () {
 }
 
 PROGRESS=0
-TOTAL_UNITS=100          # keep at 100 if you want a 0‑100 % bar
+TOTAL_UNITS=100          # keep at 100 if you want a 0‑100 % bar
 
 draw_bar () {
     local add=$1
@@ -59,7 +59,7 @@ draw_bar () {
     (( PROGRESS > TOTAL_UNITS )) && PROGRESS=$TOTAL_UNITS   # clamp
 
     local pct=$(( PROGRESS * 100 / TOTAL_UNITS ))   # integer percent
-    local filled=$(( pct / 2 ))                     # 50‑char bar (2 % each)
+    local filled=$(( pct / 2 ))                     # 50‑char bar (2 % each)
 
     # build the bar without external commands for better compatibility
     printf -v bar '%*s' "$filled" ''
@@ -101,11 +101,11 @@ while true; do
     local_progress=0
 
     if [ "$previousFreeMB" -ge 0 ]; then
-        last_iteration_progress=$(( $previousFreeMB - $freeMB))
+        last_iteration_progress=$(( previousFreeMB - freeMB))
         local_progress=$(( ((last_iteration_progress) * 100 / (totalFreeMB - minFreeMB)) ))
         draw_bar "$local_progress"
     fi
-    
+
     local_progress=0
     if [ "$freeMB" -ge 1024 ]; then
         fileSize=1G
