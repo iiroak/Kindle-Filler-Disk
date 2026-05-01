@@ -14,7 +14,18 @@ echo "--------------------------------------------------------------------"
 
 dir="fill_disk"
 mkdir -p "$dir"
-i=0
+
+# Finds the next free index for a file in the specified directory
+find_next_free_index() {
+    local index=0
+    while true; do
+        if [ ! -f "$dir/file_$index" ]; then
+            echo "$index"
+            return
+        fi
+        index=$((index + 1))
+    done
+}
 
 # Function to get free space in MB on the current filesystem
 get_free_mb() {
@@ -81,8 +92,8 @@ case "$choice" in
     *) minFreeMB=20 ;;
 esac
 
-
 echo "Filling disk with files. Please wait..."
+i=$(find_next_free_index)
 totalFreeMB=$(get_free_mb)
 previousFreeMB=-1
 while true; do
@@ -119,7 +130,7 @@ while true; do
         break
     else
         previousFreeMB=$freeMB
-        i=$((i+1))
+        i=$(find_next_free_index)
     fi
 done
 

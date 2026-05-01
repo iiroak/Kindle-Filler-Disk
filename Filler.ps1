@@ -9,7 +9,20 @@ Write-Host "--------------------------------------------------------------------
 
 $dir = "fill_disk"
 if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir | Out-Null }
-$i = 0
+
+# Function to find the next free index for a file in the specified directory.
+function Find-NextFreeIndex {
+    $index = 0
+    while ($true) {
+        $filePath = Join-Path $dir "file_$index"
+        if (-not (Test-Path $filePath)) {
+            return $index
+        }
+        $index++
+    }
+}
+
+$i = Find-NextFreeIndex
 
 function Get-FreeBytes {
     $drive = (Get-Location).Path.Substring(0,2)
@@ -66,7 +79,7 @@ while ($true) {
     fsutil file createnew $filePath $fileSize | Out-Null
     if (-not (Test-Path $filePath)) { break }
     Write-Host ("Created file_$i of size $fileLabel. Remaining free space: {0} MB" -f $freeMB)
-    $i++
+    $i = Find-NextFreeIndex
 }
 
 Write-Host "Space exhausted or less than $minFreeMB MB free after creating $i files in $dir."

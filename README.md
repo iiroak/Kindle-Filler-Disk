@@ -42,6 +42,8 @@ This utility helps fill up the storage space on your Kindle (or any device) to p
 
 ## Notes
 - It is recommended to leave only 20-50 MB of free space to effectively block updates.
+- You can safely delete individual dummy files (e.g., `file_0`, `file_1`, etc.) in the fill_disk folder if you need to free up some space temporarily.
+- The script can be started multiple times. It will automatically find the next free index and continue filling the disk without conflicts.
 - To free up space again, simply delete the `fill_disk` folder after you have finished the jailbreak process.
 
 ---
