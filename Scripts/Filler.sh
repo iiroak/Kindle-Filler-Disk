@@ -31,6 +31,10 @@ cleanup() {
 
 trap cleanup EXIT
 
+# When piped into bash (curl ... | bash), stdin is the script itself.
+# Re-point stdin to the terminal so interactive reads work.
+[ -t 0 ] || exec < /dev/tty
+
 # --- MTP STORAGE SUBFOLDER DETECTION ---
 # MTP devices expose a nested structure: the mount root is NOT writable; it
 # contains one or more storage folders (e.g. "Internal Storage",
