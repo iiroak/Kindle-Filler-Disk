@@ -10,13 +10,18 @@
 # - MTP protocol (modern Kindles via gio/gvfs, Linux only)
 # - macOS (mass storage only, no MTP support)
 
-set -e
+set -eE
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 TEMP_DIR=""
 KINDLE_PATH=""
 CONNECTION_TYPE=""
-FILE_COUNTER=0
+DEVICE_FIXED=0      # 1 = not known to be removable/external
+FILE_COUNTER=0      # next file_N index to use
+WROTE_COUNT=0       # Files actually written in this run
+WRITTEN_MB=0        # MB written in this run
+FILL_FAILED=0       # 1 = loop stopped because of an error
+MTP_LAST_ERROR=""
+ZIP_COPIED=0
 MODE="fill"
 dir="fill_disk"
 
@@ -30,6 +35,28 @@ cleanup() {
 }
 
 trap cleanup EXIT
+
+# Wait for Enter without tripping "set -e" when stdin is closed.
+pause() {
+    local _
+    read -r -p "Press Enter to exit..." _ || true
+}
+
+# Global safety net. If a command fails where we did not expect it,
+# say so (with the line number) instead of closing silently.
+on_unexpected_error() {
+    local code=$? line="$1"
+    printf '\n[!] Unexpected error (exit code %s) at line %s.\n' "$code" "$line"
+    pause
+}
+trap 'on_unexpected_error $LINENO' ERR
+
+# Private, unpredictable temp dir (works for both connection types).
+ensure_temp_dir() {
+    if [ -z "$TEMP_DIR" ] || [ ! -d "$TEMP_DIR" ]; then
+        TEMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/kindle_filler.XXXXXX")
+    fi
+}
 
 # --- MTP STORAGE SUBFOLDER DETECTION ---
 # MTP devices expose a nested structure: the mount root is NOT writable; it
@@ -54,7 +81,7 @@ mtp_pick_storage() {
     base="${base%/}"
 
     local listing
-    listing=$(gio list "$base" 2>/dev/null)
+    listing=$(gio list "$base" 2>/dev/null) || listing=""
     if [ -z "$listing" ]; then
         echo "$base"
         return
@@ -121,7 +148,7 @@ fs_pick_storage() {
     local k e
     for k in "${MTP_STORAGE_NAMES[@]}"; do
         for e in "${dirs[@]}"; do
-            [ "$e" = "$k" ] && { echo "${base}/${e}"; return; }
+            if [ "$e" = "$k" ]; then echo "${base}/${e}"; return; fi
         done
     done
     for e in "${dirs[@]}"; do
@@ -132,6 +159,11 @@ fs_pick_storage() {
     echo "${base}/${dirs[0]}"
 }
 
+# True if a URI exists on the MTP device.
+mtp_exists() {
+    gio info "$1" >/dev/null 2>&1
+}
+
 # --- PRE-BUILT ZIP FALLBACK (last resort) ---
 # When the per-file fill method fails entirely, we can download a pre-built
 # archive of zero-filled files (bundled in the repo's Zips/ folder) and copy its
@@ -140,18 +172,19 @@ fs_pick_storage() {
 ZIP_BASE_URL="https://github.com/iiroak/Kindle-Filler-Disk/raw/main/Zips"
 
 choose_zip_bucket() {
-    # Pick the largest bucket (GB) that fits in the given free MB.
+    # Pick the SMALLEST bucket (GB) that covers the free space.
     local free_mb="$1"
-    local free_gb=$((free_mb / 1024))
-    if   [ "$free_gb" -ge 64 ]; then echo 64
-    elif [ "$free_gb" -ge 32 ]; then echo 32
-    elif [ "$free_gb" -ge 16 ]; then echo 16
-    else echo 8
+    if   [ "$free_mb" -le 8192 ];  then echo 8
+    elif [ "$free_mb" -le 16384 ]; then echo 16
+    elif [ "$free_mb" -le 32768 ]; then echo 32
+    else echo 64
     fi
 }
 
+# Sets ZIP_COPIED. Returns 0 only if at least one file was written and nothing failed.
 zip_fallback() {
     local free_mb="$1"
+    ZIP_COPIED=0
 
     if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
         echo "[!] Need 'curl' or 'wget' for the zip fallback."; return 1
@@ -160,20 +193,26 @@ zip_fallback() {
         echo "[!] Need 'unzip' for the zip fallback (install: apt/dnf/pacman install unzip)."; return 1
     fi
 
-    local bucket
+    local bucket zc free_known=0
     if [ -n "$free_mb" ] && [ "$free_mb" -gt 0 ] 2>/dev/null; then
+        free_known=1
         bucket=$(choose_zip_bucket "$free_mb")
         echo "[*] Detected ~$((free_mb / 1024)) GB free -> using fill_${bucket}gb.zip"
+        if [ "$free_mb" -gt 65536 ]; then
+            echo "[!] More than 64 GB free: the largest archive will not fill the device completely."
+        fi
     else
         echo "  What is your Kindle's storage size?"
         echo "    [1] 8 GB   [2] 16 GB   [3] 32 GB   [4] 64 GB"
-        read -p "  Choice (1-4) [1]: " zc
+        read -r -p "  Choice (1-4) [1]: " zc || zc=""
         case "$zc" in 2) bucket=16;; 3) bucket=32;; 4) bucket=64;; *) bucket=8;; esac
     fi
 
+    # Always work inside our own temp dir so the EXIT trap cleans up.
+    ensure_temp_dir
     local zip="fill_${bucket}gb.zip"
     local url="$ZIP_BASE_URL/$zip"
-    local tmpzip="${TEMP_DIR:-/tmp}/kindle_${zip}"
+    local tmpzip="$TEMP_DIR/kindle_${zip}"
 
     echo "[*] Downloading $zip ..."
     if command -v curl >/dev/null 2>&1; then
@@ -182,42 +221,99 @@ zip_fallback() {
         wget -O "$tmpzip" "$url" || { echo "[!] Download failed."; return 1; }
     fi
 
+    # Go entry by entry. Before each entry, check that it still fits while
+    # leaving the requested free space, skip files that are already there,
+    # and count what was really written.
+    local keep_mb="${minFreeMB:-0}"
+    local copied=0 failed=0 skipped=0
+    local entry bn bytes size_mb now_free est_free="$free_mb" dest
+
     case "$CONNECTION_TYPE" in
         mass_storage)
-            echo "[*] Extracting into $KINDLE_PATH/$dir ..."
-            mkdir -p "$KINDLE_PATH/$dir"
-            unzip -o "$tmpzip" -d "$KINDLE_PATH/$dir"
-            ;;
+            if ! mkdir -p "$KINDLE_PATH/$dir" 2>/dev/null; then
+                echo "[!] Cannot create $KINDLE_PATH/$dir"; rm -f "$tmpzip"; return 1
+            fi ;;
         mtp)
-            # Stream one entry at a time to avoid needing GBs of local scratch.
-            gio mkdir "$KINDLE_PATH/$dir" 2>/dev/null || true
-            local scratch="${TEMP_DIR:-/tmp}"
-            local entry bn
-            while IFS= read -r entry; do
-                [ -z "$entry" ] && continue
-                case "$entry" in */) continue;; esac   # skip directory entries
-                bn=$(basename "$entry")
-                echo "  [zip] copying $bn ..."
-                unzip -p "$tmpzip" "$entry" > "$scratch/$bn" 2>/dev/null
-                gio copy "$scratch/$bn" "$KINDLE_PATH/$dir/$bn" 2>/dev/null || echo "    [!] copy failed: $bn"
-                rm -f "$scratch/$bn"
-            done < <(unzip -Z1 "$tmpzip")
-            ;;
+            if ! mtp_exists "$KINDLE_PATH/$dir"; then
+                gio mkdir "$KINDLE_PATH/$dir" 2>/dev/null || true
+            fi ;;
     esac
 
+    while IFS= read -r entry; do
+        [ -z "$entry" ] && continue
+        case "$entry" in */) continue;; esac   # skip directory entries
+        bn=$(basename "$entry")
+        bytes=$(unzip -l "$tmpzip" "$entry" 2>/dev/null | awk 'NR==4 {print $1}') || bytes=""
+        case "$bytes" in ''|*[!0-9]*) bytes=0 ;; esac
+        size_mb=$(( (bytes + 1048575) / 1048576 ))
+
+        if [ "$CONNECTION_TYPE" = "mass_storage" ]; then
+            dest="$KINDLE_PATH/$dir/$bn"
+            if [ -e "$dest" ]; then continue; fi           # already there
+            if [ "$free_known" -eq 1 ]; then
+                now_free=$(get_free_mb) || now_free=""
+                if [ -n "$now_free" ] && [ $((now_free - size_mb)) -lt "$keep_mb" ]; then
+                    skipped=$((skipped + 1)); continue
+                fi
+            fi
+            echo "  [zip] extracting $bn ..."
+            if unzip -p "$tmpzip" "$entry" > "$dest" 2>/dev/null; then
+                copied=$((copied + 1))
+            else
+                echo "    [!] extraction failed: $bn (device full?)"
+                rm -f "$dest"                               # partial file
+                failed=$((failed + 1))
+                break
+            fi
+        else
+            dest="$KINDLE_PATH/$dir/$bn"
+            if mtp_exists "$dest"; then continue; fi        # already there
+            if [ "$free_known" -eq 1 ] && [ $((est_free - size_mb)) -lt "$keep_mb" ]; then
+                skipped=$((skipped + 1)); continue
+            fi
+            echo "  [zip] copying $bn ..."
+            if unzip -p "$tmpzip" "$entry" > "$TEMP_DIR/$bn" 2>/dev/null \
+               && MTP_LAST_ERROR=$(gio copy "$TEMP_DIR/$bn" "$dest" 2>&1); then
+                copied=$((copied + 1))
+                est_free=$((est_free - size_mb))
+                rm -f "$TEMP_DIR/$bn"
+            else
+                echo "    [!] copy failed: $bn ${MTP_LAST_ERROR:+($MTP_LAST_ERROR)}"
+                rm -f "$TEMP_DIR/$bn"
+                failed=$((failed + 1))
+                break
+            fi
+        fi
+    done < <(unzip -Z1 "$tmpzip" 2>/dev/null)
+
     rm -f "$tmpzip"
-    echo "[OK] Zip fallback complete."
-    return 0
+    ZIP_COPIED=$copied
+
+    if [ "$copied" -gt 0 ] && [ "$failed" -eq 0 ]; then
+        echo "[OK] Zip fallback complete: $copied file(s) written, $skipped skipped to keep the requested free space."
+        return 0
+    elif [ "$copied" -gt 0 ]; then
+        echo "[!] Zip fallback stopped early: $copied file(s) written, $failed failed."
+        return 1
+    fi
+    echo "[!] Zip fallback wrote nothing."
+    return 1
 }
 
 echo ""
 echo "  +=============================================================+"
-echo "  |           Kindle Disk Filler Utility v2.1                   |"
+echo "  |           Kindle Disk Filler Utility v2.2                   |"
 echo "  +=============================================================+"
 echo "  |  Fills disk to prevent auto-updates on unregistered         |"
 echo "  |  tablets. Useful for jailbreak preparation.                 |"
 echo "  +=============================================================+"
 echo ""
+
+# findmnt -r escapes spaces etc. as \x20; turn them back into real
+# characters so paths with spaces work.
+decode_mnt() {
+    printf '%b' "$1"
+}
 
 # --- DETECT KINDLE DEVICE ---
 detect_kindle() {
@@ -237,7 +333,7 @@ detect_kindle() {
     # Linux: try mass storage first (faster, direct filesystem)
     local kindle_mount=$(findmnt -rn -o TARGET -S LABEL=Kindle 2>/dev/null | head -1)
     if [ -n "$kindle_mount" ]; then
-        KINDLE_PATH="$kindle_mount"
+        KINDLE_PATH="$(decode_mnt "$kindle_mount")"
         CONNECTION_TYPE="mass_storage"
         return 0
     fi
@@ -279,6 +375,38 @@ detect_kindle() {
     return 1
 }
 
+# Is this mount KNOWN to be a removable/external device?
+# Returns 0 only on a positive answer; "unknown" counts as not removable.
+is_removable_path() {
+    local p="$1" src flags
+    if [ "$(uname)" = "Darwin" ]; then
+        if diskutil info "$p" 2>/dev/null | grep -Eq 'Device Location: +External|Removable Media: +(Removable|Yes)|Protocol: +USB'; then
+            return 0
+        fi
+        return 1
+    fi
+    src=$(findmnt -rn -o SOURCE --target "$p" 2>/dev/null | head -1)
+    src="${src%%\[*}"                       # strip btrfs "[/subvol]" suffix
+    if [ -z "$src" ] || ! command -v lsblk >/dev/null 2>&1; then
+        return 1
+    fi
+    flags=$(lsblk -ndo RM,HOTPLUG "$src" 2>/dev/null | head -1)
+    case "$flags" in *1*) return 0 ;; esac
+    return 1
+}
+
+# True for the macOS boot/data volume (matched by device, not by name).
+is_macos_system_volume() {
+    local d r data
+    d=$(df -P "$1" 2>/dev/null | awk 'NR==2 {print $1}')
+    r=$(df -P / 2>/dev/null | awk 'NR==2 {print $1}')
+    data=$(df -P /System/Volumes/Data 2>/dev/null | awk 'NR==2 {print $1}')
+    if [ -n "$d" ] && { [ "$d" = "$r" ] || [ "$d" = "$data" ]; }; then
+        return 0
+    fi
+    return 1
+}
+
 # --- MANUAL DEVICE SELECTION ---
 pick_device_manual() {
     echo ""
@@ -287,14 +415,20 @@ pick_device_manual() {
 
     local devices=()
     local idx=1
+    local fixed tag
 
     # List mounted drives (mass storage)
     if [ "$(uname)" = "Darwin" ]; then
         for vol in /Volumes/*/; do
+            [ -d "$vol" ] || continue
+            vol="${vol%/}"
             local name=$(basename "$vol")
             [ "$name" = "Macintosh HD" ] && continue
-            devices+=("mass_storage|$vol|$name")
-            printf "  [%d] %s (mass storage: %s)\n" "$idx" "$name" "$vol"
+            # Skip the boot volume whatever it is called
+            if is_macos_system_volume "$vol" || is_dangerous_path "$vol"; then continue; fi
+            if is_removable_path "$vol"; then fixed=0; tag=""; else fixed=1; tag="  [!] NOT A REMOVABLE DEVICE"; fi
+            devices+=("mass_storage|$vol|$name|$fixed")
+            printf "  [%d] %s (mass storage: %s)%s\n" "$idx" "$name" "$vol" "$tag"
             idx=$((idx + 1))
         done
     else
@@ -302,7 +436,12 @@ pick_device_manual() {
             local target=$(echo "$line" | awk '{print $1}')
             local source=$(echo "$line" | awk '{print $2}')
             local label=$(echo "$line" | awk '{print $3}')
+            # Decode \x20-style escapes from findmnt -r
+            target="$(decode_mnt "$target")"
+            label="$(decode_mnt "$label")"
             [ -z "$label" ] && label="$(basename "$target")"
+            # Only real block devices (drops /run, fuse, cgroup, ...)
+            [[ "$source" == /dev/* ]] || continue
             # Skip root, boot, system mounts
             [[ "$target" == "/" ]] && continue
             [[ "$target" == /boot* ]] && continue
@@ -310,8 +449,11 @@ pick_device_manual() {
             [[ "$target" == /proc* ]] && continue
             [[ "$target" == /dev* ]] && continue
             [[ "$source" == /dev/loop* ]] && continue
-            devices+=("mass_storage|$target|$label")
-            printf "  [%d] %s (mass storage: %s)\n" "$idx" "$label" "$target"
+            # Do not even list paths we would refuse anyway
+            if is_dangerous_path "$target"; then continue; fi
+            if is_removable_path "$target"; then fixed=0; tag=""; else fixed=1; tag="  [!] NOT A REMOVABLE DEVICE"; fi
+            devices+=("mass_storage|$target|$label|$fixed")
+            printf "  [%d] %s (mass storage: %s)%s\n" "$idx" "$label" "$target" "$tag"
             idx=$((idx + 1))
         done < <(findmnt -rn -o TARGET,SOURCE,LABEL 2>/dev/null | grep -v "tmpfs\|devtmpfs\|squashfs")
     fi
@@ -321,9 +463,10 @@ pick_device_manual() {
         while IFS= read -r line; do
             local uri=$(echo "$line" | grep -o 'mtp://[^ ]*' | sed 's|/$||')
             [ -z "$uri" ] && continue
-            local name=$(echo "$line" | sed 's|.*→ *||' | sed 's| *$||')
+            # gio prints "Mount(0): NAME -> mtp://..."; take NAME.
+            local name=$(echo "$line" | sed -E 's/^[^:]*: *//; s/ *(->|→) *mtp:.*$//')
             [ -z "$name" ] && name="$uri"
-            devices+=("mtp|$uri|$name")
+            devices+=("mtp|$uri|$name|0")
             printf "  [%d] %s (MTP: %s)\n" "$idx" "$name" "$uri"
             idx=$((idx + 1))
         done < <(gio mount -l 2>/dev/null | grep "mtp://")
@@ -335,11 +478,13 @@ pick_device_manual() {
     fi
 
     echo ""
-    read -p "  Select device (1-$((idx-1))): " choice
+    local choice
+    read -r -p "  Select device (1-$((idx-1))): " choice || choice=""
     if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -lt "$idx" ]; then
         local selected="${devices[$((choice-1))]}"
         CONNECTION_TYPE=$(echo "$selected" | cut -d'|' -f1)
         local path=$(echo "$selected" | cut -d'|' -f2)
+        DEVICE_FIXED=$(echo "$selected" | cut -d'|' -f4)
 
         if [ "$CONNECTION_TYPE" = "mtp" ]; then
             # Descend into the writable storage subfolder (localized names vary)
@@ -367,10 +512,15 @@ get_free_mb() {
             df -Pm "$KINDLE_PATH" 2>/dev/null | awk 'NR==2 {print $4}'
             ;;
         mtp)
-            # filesystem::free is a mount-wide attribute; query it directly on
-            # the storage path (works regardless of localized folder name).
-            local free_bytes
-            free_bytes=$(gio info -a "filesystem::free" "$KINDLE_PATH" 2>/dev/null | awk -F': ' '/filesystem::free/ {print $2}' | tr -d ' ')
+            # filesystem::free is a FILESYSTEM attribute, so ask for it with
+            # "gio info -f"; fall back to the plain query if that returns nothing.
+            local out free_bytes
+            out=$(gio info -f -a "filesystem::free" "$KINDLE_PATH" 2>/dev/null) || out=""
+            free_bytes=$(printf '%s\n' "$out" | awk -F': ' '/filesystem::free/ {print $2; exit}' | tr -d ' ')
+            if [ -z "$free_bytes" ]; then
+                out=$(gio info -a "filesystem::free" "$KINDLE_PATH" 2>/dev/null) || out=""
+                free_bytes=$(printf '%s\n' "$out" | awk -F': ' '/filesystem::free/ {print $2; exit}' | tr -d ' ')
+            fi
             if [ -n "$free_bytes" ] && [ "$free_bytes" -gt 0 ] 2>/dev/null; then
                 echo $((free_bytes / 1024 / 1024))
             else
@@ -380,45 +530,69 @@ get_free_mb() {
     esac
 }
 
-# --- FILE CREATION ---
-create_file() {
-    local size="$1" path="$2"
-    # Normalize to MB for dd (works on all platforms)
-    local mb_size
-    if [[ "$size" == *G ]]; then
-        mb_size=$((${size%G} * 1024))
-    elif [[ "$size" == *M ]]; then
-        mb_size=${size%M}
+# The free space the fill loop should trust. For MTP we also keep our
+# own estimate (free at start - MB we wrote) and use whichever is LOWER, so a
+# stale or missing reading cannot overshoot the target.
+current_free_mb() {
+    local rep est
+    rep=$(get_free_mb) || rep=""
+    if [ "$CONNECTION_TYPE" = "mtp" ]; then
+        est=$((initialFreeMB - WRITTEN_MB))
+        if [ "$est" -lt 0 ]; then est=0; fi
+        if [ -n "$rep" ] && [ "$rep" -lt "$est" ]; then echo "$rep"; else echo "$est"; fi
     else
-        mb_size=$((size / 1024 / 1024))
+        echo "$rep"
     fi
+}
+
+# --- FILE CREATION ---
+# create_file <size in MB> <path> [sparse_ok]
+# "sparse_ok" is only passed for LOCAL temp files (MTP mode). On the
+# device itself the file must really occupy space, so truncate is not used
+# there: on filesystems with sparse-file support it would allocate nothing.
+create_file() {
+    local mb_size="$1" path="$2" sparse_ok="${3:-no}"
     [ "$mb_size" -lt 1 ] && mb_size=1
 
+    # Local temp file: a sparse file is instant and uses no disk (or RAM on a
+    # tmpfs /tmp), so try that before really allocating anything.
+    if [ "$sparse_ok" = "sparse_ok" ] && command -v truncate >/dev/null 2>&1; then
+        truncate -s "${mb_size}M" "$path" 2>/dev/null && return 0
+    fi
     if command -v fallocate >/dev/null 2>&1; then
         fallocate -l "${mb_size}M" "$path" 2>/dev/null && return 0
-    fi
-    if command -v truncate >/dev/null 2>&1; then
-        # macOS-compatible: instant sparse file
-        truncate -s "${mb_size}M" "$path" 2>/dev/null && return 0
+        rm -f "$path" 2>/dev/null || true
     fi
     if command -v mkfile >/dev/null 2>&1; then
         mkfile "${mb_size}m" "$path" 2>/dev/null && return 0
+        rm -f "$path" 2>/dev/null || true
     fi
-    dd if=/dev/zero of="$path" bs=1M count="$mb_size" status=none 2>/dev/null
+    # bs in bytes and no "status=" so BSD/macOS dd accepts it too.
+    dd if=/dev/zero of="$path" bs=1048576 count="$mb_size" 2>/dev/null
+}
+
+# True if the file exists and has exactly <MB> megabytes.
+file_has_size() {
+    local path="$1" mb="$2" actual
+    [ -f "$path" ] || return 1
+    actual=$(wc -c < "$path" 2>/dev/null | tr -d ' ')
+    [ "$actual" = "$((mb * 1048576))" ]
 }
 
 create_file_mtp() {
-    local size="$1" dest_path="$2"
+    local size_mb="$1" dest_path="$2"
     local tmp_file="${TEMP_DIR}/file_${FILE_COUNTER}"
+    MTP_LAST_ERROR=""
 
-    create_file "$size" "$tmp_file"
+    create_file "$size_mb" "$tmp_file" sparse_ok || true
 
     if [ ! -f "$tmp_file" ]; then
-        echo "[!] Failed to create temporary file"
+        MTP_LAST_ERROR="could not create local temporary file in $TEMP_DIR"
         return 1
     fi
 
-    if gio copy "$tmp_file" "$dest_path" 2>/dev/null; then
+    # Keep gio's error text so it can be shown to the user.
+    if MTP_LAST_ERROR=$(gio copy "$tmp_file" "$dest_path" 2>&1); then
         rm -f "$tmp_file"
         return 0
     else
@@ -461,14 +635,14 @@ is_dangerous_path() {
 # --- Yes/No confirmation ---
 confirm() {
     local ans
-    read -p "$1 [y/N]: " ans
+    read -r -p "$1 [y/N]: " ans || ans=""
     case "$ans" in y|Y|s|S) return 0 ;; *) return 1 ;; esac
 }
 
 # --- REMOVE FILLER (cleanup mode) with before/after free space ---
 remove_filler() {
     local before after
-    before=$(get_free_mb)
+    before=$(get_free_mb) || before=""
     echo ""
     echo "[*] Free space before: ${before:-unknown} MB"
     echo "[*] Removing '$dir' from the device..."
@@ -476,7 +650,13 @@ remove_filler() {
     case "$CONNECTION_TYPE" in
         mass_storage)
             if [ -d "$KINDLE_PATH/$dir" ]; then
-                rm -rf "$KINDLE_PATH/$dir" && echo "[OK] Removed $KINDLE_PATH/$dir"
+                # Verify the removal and report the real outcome.
+                rm -rf "$KINDLE_PATH/$dir" 2>/dev/null || true
+                if [ -e "$KINDLE_PATH/$dir" ]; then
+                    echo "[!] '$KINDLE_PATH/$dir' could not be removed completely. Some files are still there."
+                else
+                    echo "[OK] Removed $KINDLE_PATH/$dir"
+                fi
             else
                 echo "[!] No '$dir' folder found at $KINDLE_PATH"
             fi
@@ -487,23 +667,28 @@ remove_filler() {
             ;;
         mtp)
             local target="$KINDLE_PATH/$dir"
-            if gio info "$target" >/dev/null 2>&1; then
+            if mtp_exists "$target"; then
                 local f fn
                 while IFS= read -r f; do
                     [ -z "$f" ] && continue
                     fn=$(printf '%s' "$f" | cut -f1); fn="${fn%/}"
                     [ -z "$fn" ] && continue
-                    gio remove "$target/$fn" 2>/dev/null || gio trash "$target/$fn" 2>/dev/null
+                    gio remove "$target/$fn" 2>/dev/null || gio trash "$target/$fn" 2>/dev/null || true
                 done < <(gio list "$target" 2>/dev/null)
-                gio remove "$target" 2>/dev/null || gio trash "$target" 2>/dev/null
-                echo "[OK] Removed '$dir' via MTP"
+                gio remove "$target" 2>/dev/null || gio trash "$target" 2>/dev/null || true
+                # Check that it is really gone.
+                if mtp_exists "$target"; then
+                    echo "[!] '$dir' is still on the device. Some files could not be removed."
+                else
+                    echo "[OK] Removed '$dir' via MTP"
+                fi
             else
                 echo "[!] No '$dir' folder found on the device."
             fi
             ;;
     esac
 
-    after=$(get_free_mb)
+    after=$(get_free_mb) || after=""
     echo "[*] Free space after:  ${after:-unknown} MB"
     echo ""
     echo "[i] If the Kindle still reports 'storage full', disconnect it,"
@@ -515,7 +700,7 @@ echo "What do you want to do?"
 echo "  [1] Fill the device (block OTA updates)   [default]"
 echo "  [2] Remove filler files (free up space again)"
 echo ""
-read -p "  Choice (1-2) [1]: " modechoice
+read -r -p "  Choice (1-2) [1]: " modechoice || modechoice=""
 case "$modechoice" in 2) MODE="remove" ;; *) MODE="fill" ;; esac
 echo ""
 
@@ -530,7 +715,7 @@ if ! detect_kindle; then
         echo "    Fedora:         sudo dnf install gvfs gvfs-mtp"
         echo "    Arch:           sudo pacman -S gvfs gvfs-mtp"
         echo ""
-        read -p "Press Enter to exit..." _
+        pause
         exit 1
     fi
 fi
@@ -543,31 +728,30 @@ echo "     Path: $KINDLE_PATH"
 if [ "$CONNECTION_TYPE" = "mass_storage" ]; then
     if [ ! -d "$KINDLE_PATH" ]; then
         echo "[!] Error: Kindle path $KINDLE_PATH is not accessible."
-        read -p "Press Enter to exit..." _
+        pause
         exit 1
     fi
     # Verify it's writable
     if ! touch "$KINDLE_PATH/.test_write" 2>/dev/null; then
         echo "[!] Error: Cannot write to $KINDLE_PATH. Check permissions."
-        read -p "Press Enter to exit..." _
+        pause
         exit 1
     fi
     rm -f "$KINDLE_PATH/.test_write"
 elif [ "$CONNECTION_TYPE" = "mtp" ]; then
-    if ! gio info "$KINDLE_PATH" >/dev/null 2>&1; then
+    if ! mtp_exists "$KINDLE_PATH"; then
         echo "[!] Error: Cannot access Kindle via MTP at $KINDLE_PATH"
         echo "    Try disconnecting and reconnecting your Kindle."
-        read -p "Press Enter to exit..." _
+        pause
         exit 1
     fi
-    TEMP_DIR="/tmp/kindle_filler_$$"
-    mkdir -p "$TEMP_DIR"
+    ensure_temp_dir
 fi
 
 # --- REMOVE MODE: reclaim space and exit ---
 if [ "$MODE" = "remove" ]; then
     remove_filler
-    read -p "Press Enter to exit..." _
+    pause
     exit 0
 fi
 
@@ -576,24 +760,27 @@ echo ""
 # --- CREATE DIRECTORY ON KINDLE ---
 echo "[*] Preparing fill_disk directory on Kindle..."
 
+# If the folder cannot be created there is nowhere to write to, so stop here.
 case "$CONNECTION_TYPE" in
     mass_storage)
-        if mkdir -p "$KINDLE_PATH/$dir" 2>/dev/null; then
+        if mkdir -p "$KINDLE_PATH/$dir" 2>/dev/null && [ -d "$KINDLE_PATH/$dir" ]; then
             echo "[OK] Directory ready: $KINDLE_PATH/$dir"
-        elif [ -d "$KINDLE_PATH/$dir" ]; then
-            echo "[OK] Directory already exists: $KINDLE_PATH/$dir"
         else
-            echo "[!] Warning: Could not create directory, but continuing..."
+            echo "[!] Error: Could not create $KINDLE_PATH/$dir"
+            pause
+            exit 1
         fi
         ;;
     mtp)
-        # Check if directory already exists (match first field, strip trailing /)
-        if gio list "$KINDLE_PATH" 2>/dev/null | cut -f1 | sed 's|/$||' | grep -qx "$dir"; then
+        if mtp_exists "$KINDLE_PATH/$dir"; then
             echo "[OK] Directory already exists on Kindle"
         elif gio mkdir "$KINDLE_PATH/$dir" 2>/dev/null; then
             echo "[OK] Directory created on Kindle via MTP"
         else
-            echo "[!] Warning: Could not create directory via MTP, but continuing..."
+            echo "[!] Error: Could not create '$dir' on the Kindle via MTP."
+            echo "    Make sure the device is unlocked, then reconnect it and try again."
+            pause
+            exit 1
         fi
         ;;
 esac
@@ -601,12 +788,12 @@ esac
 echo ""
 
 # --- GET FREE SPACE ---
-initialFreeMB=$(get_free_mb)
+initialFreeMB=$(get_free_mb) || initialFreeMB=""
 if [ -z "$initialFreeMB" ] || [ "$initialFreeMB" -le 0 ] 2>/dev/null; then
     echo "[!] Error: Cannot determine free space on Kindle."
     echo "    This may be a temporary MTP connection issue."
     echo "    Try disconnecting and reconnecting your Kindle."
-    read -p "Press Enter to exit..." _
+    pause
     exit 1
 fi
 
@@ -624,13 +811,13 @@ echo "  [2] 50 MB  - balanced"
 echo "  [3] 100 MB - daily use (fewer notifications, still blocks most OTA)"
 echo "  [4] Custom value"
 echo ""
-read -p "  Enter your choice (1-4) [1]: " choice
+read -r -p "  Enter your choice (1-4) [1]: " choice || choice=""
 
 case "$choice" in
     2) minFreeMB=50 ;;
     3) minFreeMB=100 ;;
     4)
-        read -p "  Enter the minimum free space in MB (e.g., 30): " custom
+        read -r -p "  Enter the minimum free space in MB (e.g., 30): " custom || custom=""
         if [[ "$custom" =~ ^[0-9]+$ ]] && [ "$custom" -gt 0 ]; then
             minFreeMB=$custom
         else
@@ -645,7 +832,7 @@ targetFillMB=$((initialFreeMB - minFreeMB))
 if [ "$targetFillMB" -le 0 ]; then
     echo "[!] The requested free space ($minFreeMB MB) is >= current free space ($initialFreeMB MB)."
     echo "    Nothing to do."
-    read -p "Press Enter to exit..." _
+    pause
     exit 0
 fi
 
@@ -658,8 +845,21 @@ echo "    Will fill   : ~${targetFillMB} MB  (leaving ${minFreeMB} MB free)"
 echo "  +---------------------------------------------------------+"
 if ! confirm "  Proceed with filling this device?"; then
     echo "[!] Cancelled by user. Nothing was written."
-    read -p "Press Enter to exit..." _
+    pause
     exit 0
+fi
+
+# A disk that is not known to be removable is almost never a Kindle.
+# Require a typed word before filling it.
+if [ "$DEVICE_FIXED" = "1" ]; then
+    echo ""
+    echo "  [!] WARNING: $KINDLE_PATH is NOT a known removable/external device."
+    read -r -p "  Type FILL (capitals) to fill it anyway: " typed || typed=""
+    if [ "$typed" != "FILL" ]; then
+        echo "[!] Cancelled. Nothing was written."
+        pause
+        exit 0
+    fi
 fi
 
 echo ""
@@ -668,10 +868,35 @@ echo "    Target: fill ~${targetFillMB} MB, leave ${minFreeMB} MB free"
 echo "    Mode: $CONNECTION_TYPE"
 echo ""
 
+# True if file_N already exists in the fill folder on the device.
+# For MTP the folder is listed once (MTP_EXISTING) instead of asking the device
+# before every file.
+MTP_EXISTING=""
+filler_exists() {
+    if [ "$CONNECTION_TYPE" = "mtp" ]; then
+        case $'\n'"$MTP_EXISTING"$'\n' in *$'\n'"$1"$'\n'*) return 0 ;; esac
+        return 1
+    else
+        [ -e "$KINDLE_PATH/$dir/$1" ]
+    fi
+}
+
 # --- MAIN LOOP ---
+if [ "$CONNECTION_TYPE" = "mtp" ]; then
+    MTP_EXISTING=$(gio list "$KINDLE_PATH/$dir" 2>/dev/null | cut -f1 | sed 's|/$||') || MTP_EXISTING=""
+fi
+
+# Free space is read once per file: the reading taken after each write is
+# reused at the top of the next iteration.
+stallCount=0
+freeMB=$(current_free_mb)
 while true; do
-    freeMB=$(get_free_mb)
-    [ -z "$freeMB" ] && break
+    if [ -z "$freeMB" ]; then
+        printf '\n'
+        echo "[!] Lost access to the device (free space can no longer be read)."
+        FILL_FAILED=1
+        break
+    fi
     fillableMB=$((freeMB - minFreeMB))
     [ "$fillableMB" -le 0 ] && break
 
@@ -681,16 +906,20 @@ while true; do
     # while the device stays nearly full and OTA updates remain blocked.
     # Only the final tail uses 50/10/1 MB to land exactly on the requested free space.
     if [ "$fillableMB" -ge 100 ]; then
-        fileSize=100M
+        sizeMB=100
     elif [ "$fillableMB" -ge 50 ]; then
-        fileSize=50M
+        sizeMB=50
     elif [ "$fillableMB" -ge 10 ]; then
-        fileSize=10M
-    elif [ "$fillableMB" -ge 1 ]; then
-        fileSize=1M
+        sizeMB=10
     else
-        fileSize="${fillableMB}M"
+        sizeMB=1
     fi
+    fileSize="${sizeMB}M"
+
+    # Resume support. Never reuse a name that is already on the device.
+    while filler_exists "file_${FILE_COUNTER}"; do
+        FILE_COUNTER=$((FILE_COUNTER + 1))
+    done
 
     # Progress
     usedMB=$((initialFreeMB - freeMB))
@@ -702,25 +931,57 @@ while true; do
     # Create file
     case "$CONNECTION_TYPE" in
         mass_storage)
-            create_file "$fileSize" "$KINDLE_PATH/$dir/file_${FILE_COUNTER}"
-            if [ ! -f "$KINDLE_PATH/$dir/file_${FILE_COUNTER}" ]; then
+            dest="$KINDLE_PATH/$dir/file_${FILE_COUNTER}"
+            # Handle a failed write explicitly (set -e would otherwise end the
+            # script without a message); the file must have the full size to count.
+            if ! create_file "$sizeMB" "$dest" || ! file_has_size "$dest" "$sizeMB"; then
+                printf '\n'
+                echo "[!] Could not create file_${FILE_COUNTER} ($fileSize). The device may be full, read-only or disconnected."
+                rm -f "$dest" 2>/dev/null || true      # partial file
+                FILL_FAILED=1
                 break
             fi
             ;;
         mtp)
-            if ! create_file_mtp "$fileSize" "$KINDLE_PATH/$dir/file_${FILE_COUNTER}"; then
-                echo ""
+            if ! create_file_mtp "$sizeMB" "$KINDLE_PATH/$dir/file_${FILE_COUNTER}"; then
+                printf '\n'
                 echo "[!] Write failed. Storage might be completely full."
+                [ -n "$MTP_LAST_ERROR" ] && echo "    gio said: $MTP_LAST_ERROR"
+                FILL_FAILED=1
                 break
             fi
             ;;
     esac
 
     FILE_COUNTER=$((FILE_COUNTER + 1))
+    WROTE_COUNT=$((WROTE_COUNT + 1))
+    WRITTEN_MB=$((WRITTEN_MB + sizeMB))
 
     # Update progress
-    freeMB=$(get_free_mb)
-    [ -z "$freeMB" ] && break
+    newFreeMB=$(current_free_mb)
+    if [ -z "$newFreeMB" ]; then
+        printf '\n'
+        echo "[!] Lost access to the device (free space can no longer be read)."
+        FILL_FAILED=1
+        break
+    fi
+
+    # Stall guard. If writing files does not reduce the free space,
+    # stop instead of creating files forever.
+    if [ "$newFreeMB" -ge "$freeMB" ]; then
+        stallCount=$((stallCount + 1))
+    else
+        stallCount=0
+    fi
+    if [ "$stallCount" -ge 3 ]; then
+        printf '\n'
+        echo "[!] Free space is not going down although files are being written."
+        echo "    Stopping to avoid an endless loop. Is this really the Kindle?"
+        FILL_FAILED=1
+        break
+    fi
+
+    freeMB=$newFreeMB
     usedMB=$((initialFreeMB - freeMB))
     percent=$((usedMB * 100 / targetFillMB))
     [ "$percent" -gt 100 ] && percent=100
@@ -732,39 +993,55 @@ while true; do
     render_progress "$percent" "Done:     " "file_$((FILE_COUNTER-1)) | Free: $remainingLabel"
 
     # Small delay for MTP to prevent overwhelming the connection
-    [ "$CONNECTION_TYPE" = "mtp" ] && sleep 0.3
+    [ "$CONNECTION_TYPE" = "mtp" ] && sleep 0.1
 done
+
+# Mass storage writes go through the system's write cache. Flush it so the
+# data is really on the device before we report success.
+if [ "$CONNECTION_TYPE" = "mass_storage" ] && [ "$WROTE_COUNT" -gt 0 ]; then
+    printf '\n'
+    echo "[*] Flushing data to the device (do not unplug it yet)..."
+    sync -f "$KINDLE_PATH" 2>/dev/null || sync 2>/dev/null || true
+fi
 
 # --- ZIP FALLBACK (last resort) ---
 # If the per-file method wrote nothing, offer the pre-built archive approach.
-if [ "$FILE_COUNTER" -eq 0 ]; then
+if [ "$WROTE_COUNT" -eq 0 ]; then
     printf '\n'
     echo "[!] The per-file fill method did not write any files."
     echo "    Last resort: download a pre-built filler archive and copy it to the device."
-    read -p "  Try the pre-built zip fallback? (y/N): " usezip
+    read -r -p "  Try the pre-built zip fallback? (y/N): " usezip || usezip=""
     case "$usezip" in
         y|Y|s|S)
-            zip_fallback "$initialFreeMB" && FILE_COUNTER=-1  # -1 = filled via zip
+            # zip_fallback reports whether it really wrote anything.
+            if zip_fallback "$initialFreeMB"; then FILL_FAILED=0; else FILL_FAILED=1; fi
+            WROTE_COUNT=$((WROTE_COUNT + ZIP_COPIED))
             ;;
     esac
 fi
 
 # --- DONE ---
+# Summary: what was written this run, how much is free now,
+# and whether the fill finished or stopped early.
+finalFreeMB=$(get_free_mb) || finalFreeMB=""
+if [ "$WROTE_COUNT" -eq 0 ]; then
+    doneTitle="Nothing was written."
+elif [ "$FILL_FAILED" -eq 1 ]; then
+    doneTitle="Fill stopped early (see the message above)."
+else
+    doneTitle="Disk fill complete!"
+fi
+
 printf '\n'
 echo "  +---------------------------------------------------------+"
-echo "  |  Disk fill complete!                                    |"
-if [ "$FILE_COUNTER" -eq -1 ]; then
-    echo "  |  Filled via pre-built zip archive"
-else
-    echo "  |  Files created: $FILE_COUNTER"
-fi
+echo "  |  $doneTitle"
+echo "  |  Files written this run: $WROTE_COUNT"
+echo "  |  Free space now: ${finalFreeMB:-unknown} MB"
 echo "  |  Connection: $CONNECTION_TYPE"
-if [ "$CONNECTION_TYPE" = "mass_storage" ]; then
-    echo "  |  Directory: $KINDLE_PATH/$dir"
-else
-    echo "  |  Directory: $KINDLE_PATH/$dir"
+echo "  |  Directory: $KINDLE_PATH/$dir"
+if [ "$CONNECTION_TYPE" = "mtp" ]; then
     echo "  |  (files transferred via MTP)"
 fi
 echo "  +---------------------------------------------------------+"
 echo ""
-read -p "Press Enter to exit..." _
+pause

@@ -14,12 +14,34 @@ trap {
 
 Write-Host ""
 Write-Host "  +=============================================================+"
-Write-Host "  |               Kindle Disk Filler Utility v2.1               |"
+Write-Host "  |               Kindle Disk Filler Utility v2.2               |"
 Write-Host "  +=============================================================+"
 Write-Host "  |     Fills disk to prevent auto-updates on unregistered      |"
 Write-Host "  |         tablets. Useful for jailbreak preparation.          |"
 Write-Host "  +=============================================================+"
 Write-Host ""
+
+# --- PORTABLE DEVICE CHECK ---
+# Decide whether a "This PC" shell item is a real portable (MTP/WPD)
+# device. Drives of ANY type (system, fixed, optical, network), UNC paths and
+# ordinary filesystem folders are rejected, so they can never be picked as an
+# "MTP" target.
+function Test-IsPortableDevice($item) {
+    if (-not $item) { return $false }
+    try { if ($item.IsFileSystem) { return $false } } catch {}
+    $path = ''
+    try { $path = [string]$item.Path } catch {}
+    if ($path -match '^[A-Za-z]:') { return $false }   # drive letter path
+    if ($path -match '^\\\\')      { return $false }   # UNC / network path
+    $name = [string]$item.Name
+    try {
+        foreach ($d in [System.IO.DriveInfo]::GetDrives()) {
+            $l = $d.Name.Substring(0, 1)
+            if ($name -match "\($l`:\)") { return $false }   # e.g. "Local Disk (C:)"
+        }
+    } catch {}
+    return $true
+}
 
 # --- DETECT KINDLE ---
 function Find-Kindle {
@@ -46,7 +68,8 @@ function Find-Kindle {
         $thisPC = $shell.Namespace(0x11)
         if ($thisPC) {
             foreach ($item in $thisPC.Items()) {
-                if ($item.Name -match "Kindle") {
+                # Must also be a real portable device, not a drive/folder
+                if ($item.Name -match "Kindle" -and (Test-IsPortableDevice $item)) {
                     Write-Host "[OK] Kindle found as MTP device: $($item.Name)"
                     return @{
                         Path = $item.Path
@@ -73,7 +96,6 @@ function Select-Device {
 
     $devices = @()
     $idx = 1
-    $driveLetters = @()
 
     # List all logical disks
     $drives = Get-CimInstance Win32_LogicalDisk -ErrorAction SilentlyContinue
@@ -85,14 +107,18 @@ function Select-Device {
         $label = if ($drive.VolumeName) { $drive.VolumeName } else { "Unnamed" }
         $sizeGB = if ($drive.Size) { [math]::Round($drive.Size / 1GB, 1) } else { 0 }
         $freeGB = if ($drive.FreeSpace) { [math]::Round($drive.FreeSpace / 1GB, 1) } else { 0 }
-        $driveLetters += $drive.DeviceID[0]
+        # Flag internal/fixed disks so they are obvious in the list and
+        # require an extra confirmation later.
+        $isFixed = ($drive.DriveType -eq 3)
+        $tag = if ($isFixed) { "  [!] INTERNAL/FIXED DISK" } else { "" }
         $devices += @{
             Type = "mass_storage"
             Path = "$($drive.DeviceID)\"
             DriveLetter = $drive.DeviceID[0]
+            IsFixed = $isFixed
             Name = "$label ($($drive.DeviceID)) - ${freeGB}GB free / ${sizeGB}GB"
         }
-        Write-Host "  [$idx] $label ($($drive.DeviceID)) - ${freeGB}GB free / ${sizeGB}GB"
+        Write-Host "  [$idx] $label ($($drive.DeviceID)) - ${freeGB}GB free / ${sizeGB}GB$tag"
         $idx++
     }
 
@@ -102,16 +128,9 @@ function Select-Device {
         $thisPC = $shell.Namespace(0x11)
         if ($thisPC) {
             foreach ($item in $thisPC.Items()) {
-                # Skip items that are drives (name contains drive letter like "(C:)")
-                $isDrive = $false
-                foreach ($dl in $driveLetters) {
-                    if ($item.Name -match "\($dl`:\)") { $isDrive = $true; break }
-                }
-                if ($isDrive) { continue }
-                # Skip UNC/network paths (name contains "\\")
-                if ($item.Name -match "\\\\") { continue }
-                # Skip items that look like "This PC" itself
-                if ($item.Name -eq "This PC" -or $item.Name -eq "Este equipo") { continue }
+                # Only real portable devices: no drives of any type and no
+                # ordinary folders shown under This PC.
+                if (-not (Test-IsPortableDevice $item)) { continue }
 
                 $devices += @{
                     Type = "mtp"
@@ -259,6 +278,66 @@ function Get-MtpNextIndex($folder) {
     return $idx
 }
 
+# Shell CopyHere is asynchronous. While Windows is still copying, it
+# keeps the local source file open, so "can we open it exclusively?" tells us
+# whether the transfer is still running.
+function Test-FileUnlocked($path) {
+    try {
+        $fs = [System.IO.File]::Open($path, 'Open', 'Read', 'None')
+        $fs.Close()
+        return $true
+    } catch { return $false }
+}
+
+# Wait until the file is listed on the device AND the local source has
+# been released. Gives up if nothing shows up after $appearTimeout seconds with
+# no transfer in progress, or after the hard limit.
+function Wait-MtpCopy {
+    param($folder, [string]$name, [string]$localPath,
+          [int]$appearTimeout = 180, [int]$hardTimeout = 1200, [scriptblock]$OnTick)
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $unlockedStreak = 0
+    $lastTick = 0
+    while ($sw.Elapsed.TotalSeconds -lt $hardTimeout) {
+        # Poll 4x per second so a finished copy is noticed quickly.
+        Start-Sleep -Milliseconds 250
+        $unlocked = Test-FileUnlocked $localPath
+        if ($unlocked) { $unlockedStreak++ } else { $unlockedStreak = 0 }
+        # Only ask the device while nothing is being copied, so the transfer
+        # itself is not slowed down by extra MTP requests.
+        $present = $false
+        if ($unlocked) {
+            $present = Test-MtpItemPresent $folder $name ($unlockedStreak % 2 -eq 0)
+        }
+        # Done: on the device, and source released for 2 checks in a row.
+        if ($present -and $unlockedStreak -ge 2) { return $true }
+        $sec = [int]$sw.Elapsed.TotalSeconds
+        # Not on the device, nothing copying, and we waited long enough: failed.
+        if (-not $present -and $unlocked -and $sec -ge $appearTimeout) { return $false }
+        if ($OnTick -and $sec -ge ($lastTick + 5)) { $lastTick = $sec; & $OnTick $sec }
+    }
+    return $false
+}
+
+# True if <name> is in the MTP folder. ParseName is a single lookup; walking
+# the whole folder (slow with hundreds of files) is only done when $fullScan
+# is set and the quick lookup found nothing.
+function Test-MtpItemPresent($folder, [string]$name, [bool]$fullScan) {
+    try { if ($folder.ParseName($name)) { return $true } } catch {}
+    if ($fullScan) { return (Get-MtpItemNames $folder).ContainsKey($name) }
+    return $false
+}
+
+# Free space the fill loop should trust. The value Windows reports for
+# MTP storage is often cached, so we also keep our own estimate
+# (free at start - bytes we wrote) and use whichever is LOWER.
+function Get-MtpEffectiveFree($storageFolder, [long]$startFree, [long]$written) {
+    $est = [Math]::Max($startFree - $written, 0)
+    $reported = Get-MtpFreeBytes $storageFolder
+    if ($reported -gt 0 -and $reported -lt $est) { return [long]$reported }
+    return [long]$est
+}
+
 # --- PRE-BUILT ZIP FALLBACK (last resort) ---
 # When the per-file fill method fails entirely, download a pre-built archive of
 # zero-filled files and copy its contents onto the device. Archives hold
@@ -266,24 +345,32 @@ function Get-MtpNextIndex($folder) {
 $script:ZipBaseUrl = "https://github.com/iiroak/Kindle-Filler-Disk/raw/main/Zips"
 
 function Get-ZipBucket($freeBytes) {
+    # Round UP to the smallest archive that covers the free space.
     $gb = $freeBytes / 1GB
-    if ($gb -ge 64) { return 64 }
-    elseif ($gb -ge 32) { return 32 }
-    elseif ($gb -ge 16) { return 16 }
-    else { return 8 }
+    if     ($gb -le 8)  { return 8 }
+    elseif ($gb -le 16) { return 16 }
+    elseif ($gb -le 32) { return 32 }
+    else                { return 64 }
 }
 
+# Returns @{ Ok = <bool>; Copied = <int> }
 function Invoke-ZipFallback {
-    param($kindle, [long]$freeBytes, $massTargetDir, $mtpFillFolder, $tempDir)
+    param($kindle, [long]$freeBytes, [long]$minFreeBytes, $massTargetDir, $mtpFillFolder, $tempDir)
+
+    $result = @{ Ok = $false; Copied = 0 }
 
     if ($tempDir -and -not (Test-Path $tempDir)) {
         New-Item -ItemType Directory -Path $tempDir -Force | Out-Null
     }
 
     # Choose bucket by free space, or ask if unknown.
-    if ($freeBytes -gt 0) {
+    $freeKnown = $freeBytes -gt 0
+    if ($freeKnown) {
         $bucket = Get-ZipBucket $freeBytes
         Write-Host "[*] Detected $([math]::Round($freeBytes/1GB,1)) GB free -> using fill_${bucket}gb.zip"
+        if ($freeBytes -gt 64GB) {
+            Write-Host "[!] More than 64 GB free: the largest archive will not fill the device completely."
+        }
     } else {
         Write-Host "  What is your Kindle's storage size?"
         Write-Host "    [1] 8 GB   [2] 16 GB   [3] 32 GB   [4] 64 GB"
@@ -301,43 +388,87 @@ function Invoke-ZipFallback {
         (New-Object System.Net.WebClient).DownloadFile($url, $tmpzip)
     } catch {
         Write-Host "[!] Download failed: $_"
-        return $false
+        return $result
     }
-    if (-not (Test-Path $tmpzip)) { Write-Host "[!] Download failed."; return $false }
+    if (-not (Test-Path $tmpzip)) { Write-Host "[!] Download failed."; return $result }
 
-    if ($kindle.Type -eq "mass_storage") {
-        Write-Host "[*] Extracting into $massTargetDir ..."
-        try {
-            Expand-Archive -Path $tmpzip -DestinationPath $massTargetDir -Force
-        } catch {
-            Write-Host "[!] Extraction failed: $_"
-            Remove-Item $tmpzip -Force -ErrorAction SilentlyContinue
-            return $false
-        }
-    } else {
-        # MTP: extract one entry at a time to avoid needing GBs of scratch space.
-        Add-Type -AssemblyName System.IO.Compression.FileSystem
+    # Go entry by entry. Before each entry, check that it still fits while
+    # leaving the requested free space, and count what was really written.
+    $copied = 0; $failed = 0; $skipped = 0
+    $estFree = $freeBytes
+    $existing = @{}
+    if ($kindle.Type -ne "mass_storage") { $existing = Get-MtpItemNames $mtpFillFolder }
+
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $za = $null
+    try {
         $za = [System.IO.Compression.ZipFile]::OpenRead($tmpzip)
-        try {
-            foreach ($e in $za.Entries) {
-                if ([string]::IsNullOrEmpty($e.Name)) { continue }  # directory entry
+        foreach ($e in $za.Entries) {
+            if ([string]::IsNullOrEmpty($e.Name)) { continue }  # directory entry
+
+            if ($kindle.Type -eq "mass_storage") {
+                $dest = Join-Path $massTargetDir $e.Name
+                if (Test-Path $dest) { continue }               # already there
+                if ($freeKnown) {
+                    $estFree = Get-FreeBytes $kindle
+                    if (($estFree - $e.Length) -lt $minFreeBytes) { $skipped++; continue }
+                }
+                Write-Host "  [zip] extracting $($e.Name) ..."
+                try {
+                    [System.IO.Compression.ZipFileExtensions]::ExtractToFile($e, $dest, $false)
+                    $copied++
+                } catch {
+                    Write-Host "[!] Extraction of $($e.Name) failed: $($_.Exception.Message)"
+                    Remove-Item $dest -Force -ErrorAction SilentlyContinue   # partial file
+                    $failed++
+                    break
+                }
+            } else {
+                if ($existing.ContainsKey($e.Name)) { continue }  # already there
+                if ($freeKnown -and (($estFree - $e.Length) -lt $minFreeBytes)) { $skipped++; continue }
                 $tmpf = Join-Path $tempDir $e.Name
                 Write-Host "  [zip] copying $($e.Name) ..."
-                [System.IO.Compression.ZipFileExtensions]::ExtractToFile($e, $tmpf, $true)
-                $mtpFillFolder.CopyHere($tmpf, 0x14)
-                $waited = 0
-                while ($waited -lt 180) {
-                    Start-Sleep -Seconds 1; $waited++
-                    if ((Get-MtpItemNames $mtpFillFolder).ContainsKey($e.Name)) { break }
+                $ok = $false
+                try {
+                    [System.IO.Compression.ZipFileExtensions]::ExtractToFile($e, $tmpf, $true)
+                    $mtpFillFolder.CopyHere($tmpf, 0x14)
+                    $ok = Wait-MtpCopy -folder $mtpFillFolder -name $e.Name -localPath $tmpf
+                } catch {
+                    Write-Host "[!] Copy of $($e.Name) failed: $($_.Exception.Message)"
                 }
                 Remove-Item $tmpf -Force -ErrorAction SilentlyContinue
+                if ($ok) {
+                    $copied++
+                    $estFree -= $e.Length
+                } else {
+                    Write-Host "[!] $($e.Name) did not arrive on the device. Stopping."
+                    $failed++
+                    break
+                }
             }
-        } finally { $za.Dispose() }
+        }
+    } catch {
+        Write-Host "[!] Could not read the archive: $($_.Exception.Message)"
+        $failed++
+    } finally {
+        if ($za) { $za.Dispose() }
     }
 
     Remove-Item $tmpzip -Force -ErrorAction SilentlyContinue
-    Write-Host "[OK] Zip fallback complete."
-    return $true
+    if ($kindle.Type -ne "mass_storage" -and $tempDir -and (Test-Path $tempDir)) {
+        Remove-Item $tempDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    $result.Copied = $copied
+    $result.Ok = ($copied -gt 0 -and $failed -eq 0)
+    if ($result.Ok) {
+        Write-Host "[OK] Zip fallback complete: $copied file(s) written, $skipped skipped to keep the requested free space."
+    } elseif ($copied -gt 0) {
+        Write-Host "[!] Zip fallback stopped early: $copied file(s) written, $failed failed."
+    } else {
+        Write-Host "[!] Zip fallback wrote nothing."
+    }
+    return $result
 }
 
 # --- REMOVE FILLER (cleanup mode) with before/after free space ---
@@ -351,8 +482,17 @@ function Remove-Filler {
         $target = Join-Path $kindle.Path $dir
         Write-Host "[*] Removing '$dir' ..."
         if (Test-Path $target) {
-            Remove-Item -Path $target -Recurse -Force -ErrorAction SilentlyContinue
-            Write-Host "[OK] Removed $target"
+            # Verify the removal and report the real outcome.
+            try {
+                Remove-Item -Path $target -Recurse -Force -ErrorAction Stop
+            } catch {
+                Write-Host "[!] Error while removing: $($_.Exception.Message)"
+            }
+            if (Test-Path $target) {
+                Write-Host "[!] '$target' could not be removed completely. Some files are still there."
+            } else {
+                Write-Host "[OK] Removed $target"
+            }
         } else {
             Write-Host "[!] No '$dir' folder found at $target"
         }
@@ -363,20 +503,56 @@ function Remove-Filler {
         if (-not $storage) { Write-Host "[!] Cannot access MTP storage."; return }
         $before = Get-MtpFreeBytes $storage
         Write-Host "[*] Free space before: $(Get-PrettySize $before)"
-        Write-Host "[*] Removing '$dir' via MTP ..."
+
+        # Delete the whole folder in ONE operation (one Windows prompt
+        # instead of one per file), then wait until it is really gone.
+        $foundAnything = $false
         $fdItem = $storage.ParseName($dir)
         if ($fdItem -and $fdItem.IsFolder) {
-            $fill = $fdItem.GetFolder()
-            $items = $fill.Items()
-            for ($k = $items.Count - 1; $k -ge 0; $k--) {
-                try { $items.Item($k).InvokeVerb('delete') } catch {}
+            $foundAnything = $true
+            Write-Host "[*] Removing '$dir' via MTP ..."
+            Write-Host "    If Windows asks for confirmation, click Yes. This can take a few minutes."
+            try { $fdItem.InvokeVerb('delete') } catch {}
+            $waited = 0
+            $gone = $false
+            while ($waited -lt 600) {
+                Start-Sleep -Seconds 2; $waited += 2
+                if (-not (Get-MtpItemNames $storage).ContainsKey($dir)) { $gone = $true; break }
             }
-            Start-Sleep -Seconds 2
-            try { $storage.ParseName($dir).InvokeVerb('delete') } catch {}
-            Write-Host "[OK] Removed '$dir'"
-        } else {
-            Write-Host "[!] No '$dir' folder found on the device."
+            if ($gone) { Write-Host "[OK] Removed '$dir'" }
+            else { Write-Host "[!] '$dir' is still on the device (delete declined or still running)." }
         }
+
+        # Fill mode writes into the storage root when it cannot create
+        # the subfolder. Find those leftovers too (names like file_0, file_1 ...).
+        $rootFiles = @()
+        try {
+            $items = $storage.Items()
+            for ($k = 0; $k -lt $items.Count; $k++) {
+                $it = $items.Item($k)
+                if ($it -and -not $it.IsFolder -and $it.Name -match '^file_\d+$') { $rootFiles += $it }
+            }
+        } catch {}
+        if ($rootFiles.Count -gt 0) {
+            $foundAnything = $true
+            Write-Host "[*] Found $($rootFiles.Count) filler file(s) in the storage root (file_N)."
+            Write-Host "    Windows may ask for confirmation once per file."
+            $delRoot = Read-Host "  Delete them? (y/N)"
+            if ($delRoot -match '^[yYsS]') {
+                foreach ($rf in $rootFiles) { try { $rf.InvokeVerb('delete') } catch {} }
+                $waited = 0
+                while ($waited -lt 600) {
+                    Start-Sleep -Seconds 2; $waited += 2
+                    $left = @((Get-MtpItemNames $storage).Keys | Where-Object { $_ -match '^file_\d+$' }).Count
+                    if ($left -eq 0) { break }
+                }
+                if ($left -eq 0) { Write-Host "[OK] Removed filler files from the storage root" }
+                else { Write-Host "[!] $left filler file(s) are still in the storage root." }
+            }
+        }
+
+        if (-not $foundAnything) { Write-Host "[!] No filler files found on the device." }
+
         Start-Sleep -Seconds 1
         $after = Get-MtpFreeBytes $storage
         Write-Host "[*] Free space after:  $(Get-PrettySize $after)"
@@ -431,15 +607,6 @@ function Write-ProgressLine {
     [Console]::Write(("`r{0}" -f $line.PadRight($width)))
 }
 
-function Find-NextFreeIndex($dir) {
-    $index = 0
-    while ($true) {
-        $filePath = Join-Path $dir "file_$index"
-        if (-not (Test-Path $filePath)) { return $index }
-        $index++
-    }
-}
-
 # --- MODE SELECTION ---
 Write-Host "What do you want to do?"
 Write-Host "  [1] Fill the device (block OTA updates)   [default]"
@@ -457,7 +624,8 @@ if (-not $kindle) {
         Write-Host ""
         Write-Host "[!] No devices available."
         Write-Host ""
-        Write-Host "    For MTP Kindles on Linux, install: gvfs gvfs-backends"
+        Write-Host "    Make sure the Kindle is unlocked and connected with a data-capable"
+        Write-Host "    USB cable, and that it shows up in File Explorer under 'This PC'."
         Write-Host ""
         Read-Host "Press Enter to exit"
         exit
@@ -535,15 +703,15 @@ Write-Host ""
 
 # --- GET FREE SPACE ---
 $totalFreeBytes = Get-FreeBytes $kindle
-$mtpFreeKnown = $totalFreeBytes -gt 0
+$freeKnown = $totalFreeBytes -gt 0
 
-if ($mtpFreeKnown) {
+if ($freeKnown) {
     Write-Host "[OK] Available space: $(Get-PrettySize $totalFreeBytes)"
 } elseif ($kindle.Type -eq "mtp") {
     # MTP free space via System.FreeSpace extended property on the storage folder
     $totalFreeBytes = Get-MtpFreeBytes $mtpStorageFolder
     if ($totalFreeBytes -gt 0) {
-        $mtpFreeKnown = $true
+        $freeKnown = $true
         $capBytes = Get-MtpCapacityBytes $mtpStorageFolder
         if ($capBytes -gt 0) {
             Write-Host "[OK] Available space (MTP): $(Get-PrettySize $totalFreeBytes) free / $(Get-PrettySize $capBytes) total"
@@ -590,7 +758,7 @@ if ($choice -eq "2") {
 $minFreeBytes = [long]$minFreeMB * 1MB
 
 # Validate free space if known
-if ($mtpFreeKnown) {
+if ($freeKnown) {
     $targetFillBytes = $totalFreeBytes - $minFreeBytes
     if ($targetFillBytes -le 0) {
         Write-Host "[!] The requested free space ($minFreeMB MB) is >= current free space. Nothing to do."
@@ -630,11 +798,23 @@ if ($proceed -notmatch '^[yYsS]') {
     Read-Host "Press Enter to exit"
     exit
 }
+# A fixed/internal disk is almost never a Kindle. Require a typed word.
+if ($kindle.IsFixed) {
+    Write-Host ""
+    Write-Host "  [!] WARNING: $($kindle.Path) is an INTERNAL/FIXED disk, not a removable device."
+    $typed = Read-Host "  Type FILL (capitals) to fill it anyway"
+    if ($typed -cne 'FILL') {
+        Write-Host "[!] Cancelled. Nothing was written."
+        Read-Host "Press Enter to exit"
+        exit
+    }
+}
 Write-Host ""
 
 # --- MAIN LOOP ---
 $i = 0
 $wroteCount = 0
+$fillFailed = $false   # Set when the loop stops because of an error
 
 if ($kindle.Type -eq "mass_storage") {
     # ---- MASS STORAGE MODE ----
@@ -649,10 +829,12 @@ if ($kindle.Type -eq "mass_storage") {
         if ($fileSize -le 0) { break }
 
         $fileLabel = Get-PrettySize $fileSize
+        # Resume support: skip names that already exist.
+        while (Test-Path (Join-Path $targetDir "file_$i")) { $i++ }
         $filePath = Join-Path $targetDir "file_$i"
 
         # Progress
-        if ($mtpFreeKnown) {
+        if ($freeKnown) {
             $usedBytes = $totalFreeBytes - $currentFree
             $percent = [math]::Floor(($usedBytes * 100) / $targetFillBytes)
             if ($percent -lt 0) { $percent = 0 }
@@ -664,9 +846,18 @@ if ($kindle.Type -eq "mass_storage") {
         Write-ProgressLine -Percent $percent -Status "Creating: " -Detail "file_$i ($fileLabel)"
 
         # Create file
-        fsutil file createnew $filePath $fileSize | Out-Null
-
-        if (-not (Test-Path $filePath)) { break }
+        # Verify the result (exit code + actual size) and show the error.
+        $fsOut = & fsutil file createnew $filePath $fileSize 2>&1
+        $created = ($LASTEXITCODE -eq 0) -and (Test-Path $filePath)
+        if ($created) {
+            try { $created = ((Get-Item $filePath).Length -eq $fileSize) } catch { $created = $false }
+        }
+        if (-not $created) {
+            Write-Host "`n[!] Could not create file_$i ($fileLabel): $(($fsOut | Out-String).Trim())"
+            Remove-Item $filePath -Force -ErrorAction SilentlyContinue   # partial file
+            $fillFailed = $true
+            break
+        }
 
         $i++
         $wroteCount++
@@ -674,7 +865,7 @@ if ($kindle.Type -eq "mass_storage") {
         # Progress update
         $currentFree = Get-FreeBytes $kindle
         $remainingLabel = Get-PrettySize $currentFree
-        if ($mtpFreeKnown) {
+        if ($freeKnown) {
             $usedBytes = $totalFreeBytes - $currentFree
             $percent = [math]::Floor(($usedBytes * 100) / $targetFillBytes)
             if ($percent -lt 0) { $percent = 0 }
@@ -697,19 +888,23 @@ if ($kindle.Type -eq "mass_storage") {
     if ($i -gt 0) { Write-Host "[*] Resuming from file_$i (existing files detected)" }
 
     $mtpChunk = [long]100MB   # 100MB chunks: balance of speed and MTP reliability
+    $mtpBytesWritten = [long]0   # Our own running total
+    # Names already on the device: listed once here, then kept up to date
+    # locally instead of walking the folder before every file.
+    $existingNames = Get-MtpItemNames $targetFolder
+    $pooledTmp = $null           # temp file kept from the previous chunk
+    $pooledSize = [long]0
 
     while ($true) {
         # Determine current free space and remaining fillable amount
         $currentFree = 0
-        if ($mtpFreeKnown) {
-            $currentFree = Get-MtpFreeBytes $mtpStorageFolder
-            if ($currentFree -gt 0) {
-                $fillableBytes = $currentFree - $minFreeBytes
-                if ($fillableBytes -le 0) { break }
-                $fileSize = Get-FillChunk $fillableBytes
-            } else {
-                $fileSize = $mtpChunk
-            }
+        if ($freeKnown) {
+            # Use the lower of "reported free" and "start - written".
+            # A stale or zero reading must never trigger a blind 100 MB chunk.
+            $currentFree = Get-MtpEffectiveFree $mtpStorageFolder $totalFreeBytes $mtpBytesWritten
+            $fillableBytes = $currentFree - $minFreeBytes
+            if ($fillableBytes -le 0) { break }
+            $fileSize = Get-FillChunk $fillableBytes
         } else {
             $fileSize = $mtpChunk
         }
@@ -717,8 +912,11 @@ if ($kindle.Type -eq "mass_storage") {
 
         $fileLabel = Get-PrettySize $fileSize
 
+        # Never reuse a name that is already on the device.
+        while ($existingNames.ContainsKey("file_$i")) { $i++ }
+
         # Progress (only meaningful when free space is known)
-        if ($mtpFreeKnown -and $currentFree -gt 0 -and $totalFreeBytes -gt 0) {
+        if ($freeKnown -and $currentFree -gt 0 -and $totalFreeBytes -gt 0) {
             $usedBytes = $totalFreeBytes - $currentFree
             $percent = [math]::Floor(($usedBytes * 100) / [Math]::Max([long]$targetFillBytes, 1))
             if ($percent -lt 0) { $percent = 0 }
@@ -729,12 +927,22 @@ if ($kindle.Type -eq "mass_storage") {
 
         Write-ProgressLine -Percent $percent -Status "Creating: " -Detail "file_$i ($fileLabel)"
 
-        # Create temp file locally
+        # Local temp file. The one from the previous chunk is renamed and
+        # reused when it has the same size, instead of creating a new one.
         $tmpFile = Join-Path $tempDir "file_$i"
-        fsutil file createnew $tmpFile $fileSize | Out-Null
+        $reused = $false
+        if ($pooledTmp -and $pooledSize -eq $fileSize -and (Test-Path $pooledTmp)) {
+            try { Move-Item -Path $pooledTmp -Destination $tmpFile -Force -ErrorAction Stop; $reused = $true } catch {}
+        }
+        if (-not $reused) {
+            if ($pooledTmp) { Remove-Item -Path $pooledTmp -Force -ErrorAction SilentlyContinue }
+            fsutil file createnew $tmpFile $fileSize | Out-Null
+        }
+        $pooledTmp = $null
 
         if (-not (Test-Path $tmpFile)) {
             Write-Host "`n[!] Failed to create temporary file"
+            $fillFailed = $true
             break
         }
 
@@ -744,18 +952,10 @@ if ($kindle.Type -eq "mass_storage") {
             try {
                 $targetFolder.CopyHere($tmpFile, 0x14)
 
-                # Wait for the file to appear on the device (index-based check).
-                $timeout = 180
-                $waited = 0
-                while ($waited -lt $timeout) {
-                    Start-Sleep -Seconds 1
-                    $waited++
-                    $names = Get-MtpItemNames $targetFolder
-                    if ($names.ContainsKey("file_$i")) { $copySuccess = $true; break }
-                    if ($waited % 5 -eq 0) {
-                        Write-ProgressLine -Percent $percent -Status "Copying:  " -Detail "file_$i ($fileLabel) - ${waited}s"
-                    }
-                }
+                # Wait until the file is on the device AND Windows has
+                # released the temp file, so it is never deleted mid-transfer.
+                $tick = { param($sec) Write-ProgressLine -Percent $percent -Status "Copying:  " -Detail "file_$i ($fileLabel) - ${sec}s" }
+                $copySuccess = Wait-MtpCopy -folder $targetFolder -name "file_$i" -localPath $tmpFile -OnTick $tick
             } catch {
                 Write-Host "`n[!] MTP copy failed: $_"
             }
@@ -763,20 +963,29 @@ if ($kindle.Type -eq "mass_storage") {
             Write-Host "`n[!] No target folder on device"
         }
 
-        # Cleanup temp file
-        Remove-Item -Path $tmpFile -Force -ErrorAction SilentlyContinue
+        # Keep the temp file for the next chunk; remove it if the copy failed.
+        if ($copySuccess) {
+            $pooledTmp = $tmpFile
+            $pooledSize = $fileSize
+            $existingNames["file_$i"] = $true
+        } else {
+            Remove-Item -Path $tmpFile -Force -ErrorAction SilentlyContinue
+        }
 
         if (-not $copySuccess) {
             Write-Host "`n[!] Failed to copy file_$i to device. Storage may be full."
+            # Expected way to stop when free space is unknown; an error otherwise.
+            if ($freeKnown -or $wroteCount -eq 0) { $fillFailed = $true }
             break
         }
 
         $i++
         $wroteCount++
+        $mtpBytesWritten += $fileSize
 
         # Progress update
-        if ($mtpFreeKnown) {
-            $currentFree = Get-MtpFreeBytes $mtpStorageFolder
+        if ($freeKnown) {
+            $currentFree = Get-MtpEffectiveFree $mtpStorageFolder $totalFreeBytes $mtpBytesWritten
             if ($currentFree -gt 0) {
                 $remainingLabel = Get-PrettySize $currentFree
                 $usedBytes = $totalFreeBytes - $currentFree
@@ -788,7 +997,7 @@ if ($kindle.Type -eq "mass_storage") {
         }
 
         # Small delay for MTP stability
-        Start-Sleep -Milliseconds 300
+        Start-Sleep -Milliseconds 100
     }
 
     # Cleanup temp dir
@@ -805,28 +1014,47 @@ if ($wroteCount -eq 0) {
     Write-Host "    Last resort: download a pre-built filler archive and copy it to the device."
     $useZip = Read-Host "  Try the pre-built zip fallback? (y/N)"
     if ($useZip -match '^[yYsS]') {
+        # The fallback respects the "leave free" setting and returns what it wrote.
         if ($kindle.Type -eq "mass_storage") {
             $freeForZip = Get-FreeBytes $kindle
             $targetDir = Join-Path $kindle.Path $dir
             if (-not (Test-Path $targetDir)) { New-Item -ItemType Directory -Path $targetDir -Force | Out-Null }
-            [void](Invoke-ZipFallback -kindle $kindle -freeBytes $freeForZip -massTargetDir $targetDir -mtpFillFolder $null -tempDir $env:TEMP)
+            $zipResult = @(Invoke-ZipFallback -kindle $kindle -freeBytes $freeForZip -minFreeBytes $minFreeBytes -massTargetDir $targetDir -mtpFillFolder $null -tempDir $null)[-1]
         } else {
             $freeForZip = Get-MtpFreeBytes $mtpStorageFolder
-            [void](Invoke-ZipFallback -kindle $kindle -freeBytes $freeForZip -massTargetDir $null -mtpFillFolder $mtpFillFolder -tempDir (Join-Path $env:TEMP "kindle_filler_$PID"))
+            $zipResult = @(Invoke-ZipFallback -kindle $kindle -freeBytes $freeForZip -minFreeBytes $minFreeBytes -massTargetDir $null -mtpFillFolder $mtpFillFolder -tempDir (Join-Path $env:TEMP "kindle_filler_$PID"))[-1]
         }
+        $wroteCount += $zipResult.Copied
+        $fillFailed = -not $zipResult.Ok
     }
 }
 
 # --- DONE ---
+# Summary: what was written this run, how much is free now,
+# and whether the fill finished or stopped early.
+if ($kindle.Type -eq "mass_storage") {
+    $finalFree = Get-FreeBytes $kindle
+} else {
+    $finalFree = Get-MtpFreeBytes $mtpStorageFolder
+}
+if ($wroteCount -eq 0) {
+    $doneTitle = "Nothing was written."
+} elseif ($fillFailed) {
+    $doneTitle = "Fill stopped early (see the message above)."
+} else {
+    $doneTitle = "Disk fill complete!"
+}
+$finalFreeLabel = if ($finalFree -gt 0) { Get-PrettySize $finalFree } else { "unknown" }
 Write-Host ""
 Write-Host "  +---------------------------------------------------------+"
-Write-Host "  |  Disk fill complete!                                    |"
-Write-Host "  |  Files created: $i"
+Write-Host "  |  $doneTitle"
+Write-Host "  |  Files written this run: $wroteCount"
+Write-Host "  |  Free space now: $finalFreeLabel"
 Write-Host "  |  Connection: $($kindle.Type)"
 if ($kindle.Type -eq "mass_storage") {
     Write-Host "  |  Directory: $($kindle.Path)$dir"
 } else {
-    Write-Host "  |  Directory: $($kindle.Path)\$dir"
+    Write-Host "  |  Directory: $($kindle.Name) -> $dir"
     Write-Host "  |  (files transferred via MTP)"
 }
 Write-Host "  +---------------------------------------------------------+"
