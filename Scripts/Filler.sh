@@ -546,10 +546,17 @@ current_free_mb() {
 }
 
 # --- FILE CREATION ---
+# True if the file occupies (at least 90% of) <MB> megabytes on disk.
+is_really_allocated() {
+    local kb
+    kb=$(du -k "$1" 2>/dev/null | awk '{print $1}')
+    [ -n "$kb" ] && [ "$kb" -ge $(( $2 * 1024 * 9 / 10 )) ]
+}
+
 # create_file <size in MB> <path> [sparse_ok]
 # "sparse_ok" is only passed for LOCAL temp files (MTP mode). On the
-# device itself the file must really occupy space, so truncate is not used
-# there: on filesystems with sparse-file support it would allocate nothing.
+# device itself the file must really occupy space: on filesystems with
+# sparse-file support a plain truncate would allocate nothing.
 create_file() {
     local mb_size="$1" path="$2" sparse_ok="${3:-no}"
     [ "$mb_size" -lt 1 ] && mb_size=1
@@ -561,6 +568,14 @@ create_file() {
     fi
     if command -v fallocate >/dev/null 2>&1; then
         fallocate -l "${mb_size}M" "$path" 2>/dev/null && return 0
+        rm -f "$path" 2>/dev/null || true
+    fi
+    # On the device, truncate is only accepted if it really allocated the
+    # space (it does on FAT32, which has no sparse files).
+    if [ "$sparse_ok" != "sparse_ok" ] && command -v truncate >/dev/null 2>&1; then
+        if truncate -s "${mb_size}M" "$path" 2>/dev/null && is_really_allocated "$path" "$mb_size"; then
+            return 0
+        fi
         rm -f "$path" 2>/dev/null || true
     fi
     if command -v mkfile >/dev/null 2>&1; then

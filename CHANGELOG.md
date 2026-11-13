@@ -2,8 +2,8 @@
 
 ## 2.2 - 2026-11-13
 
-Bug-fix release for both scripts: `Kindle-Filler-Disk.ps1` (Windows) and
-`kindle-filler-disk.sh` (Linux/macOS).
+Bug-fix release for both scripts: `Scripts/Filler.ps1` (Windows) and
+`Scripts/Filler.sh` (Linux/macOS).
 
 ### Safety
 
@@ -35,9 +35,9 @@ Bug-fix release for both scripts: `Kindle-Filler-Disk.ps1` (Windows) and
   device and Windows has released the local temp file. The temp file is no
   longer deleted mid-transfer.
 - **PowerShell:** `fsutil` results are checked by exit code.
-- **Bash:** Filler files are really allocated on the device. The sparse
-  `truncate` shortcut is only used for local temp files; on a filesystem with
-  sparse-file support it used no space and the loop never ended.
+- **Bash:** Filler files are really allocated on the device. The `truncate`
+  shortcut is only accepted there if it actually used the space; on a
+  filesystem with sparse-file support it used none and the loop never ended.
 - **Bash:** A stall guard stops the loop if free space does not go down.
 - **Bash:** The `dd` fallback works with BSD/macOS `dd`.
 - **Bash:** No more silent exits. With `set -e`, a failed write, unzip or
