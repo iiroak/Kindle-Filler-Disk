@@ -69,16 +69,23 @@ When you run the script it first asks what to do:
   - `20 MB` aggressive OTA block (may trigger "storage almost full" notifications)
   - `50 MB` balanced
   - `100 MB` daily use (fewer notifications, still blocks most OTA)
-- **Remove** — deletes the `fill_disk/` folder and reports free space **before
-  and after**, so you can verify the space was reclaimed.
+- **Remove** — deletes the `fill_disk/` folder, checks that it is really gone,
+  and reports free space **before and after**, so you can verify the space was
+  reclaimed. On Windows MTP devices, Windows may ask you to confirm the delete.
+
+When a fill ends, the summary shows how many files were written in this run,
+how much space is free now, and whether the fill completed or stopped early.
 
 ### Safety
 
 - The script never fills your PC by accident: it only writes to a detected
   Kindle or a device you explicitly pick, and it **refuses** system/home paths
   (`/`, `/home`, Desktop, Downloads, the Windows system drive, …).
-- On Windows, if the script is launched by double-click and hits an error, it
-  now shows the error and waits instead of closing the window silently.
+- If no Kindle is detected, the manual list only offers real storage devices.
+  Anything that is not a removable/external device is labeled, and you must
+  type `FILL` before the script writes to it.
+- If the script hits an error, it shows the error and waits instead of closing
+  the window silently (Windows) or exiting without a message (Linux/macOS).
 
 ## Supported Devices
 
@@ -150,11 +157,13 @@ and copy its contents into `fill_disk/` on the device.
 
 - The archives are tiny to download (~8–66 MB) but expand to ~8/16/32/64 GB
   (zeros compress about 1000:1).
-- The script picks the largest archive that fits your device's free space
+- The script picks the smallest archive that covers your device's free space
   (`fill_8gb.zip`, `fill_16gb.zip`, `fill_32gb.zip`, `fill_64gb.zip`). If free
   space can't be read, it asks for your Kindle's size.
-- On MTP the archive is streamed one file at a time, so it does **not** need
+- The archive is extracted one file at a time, so it does **not** need
   gigabytes of scratch space on your PC.
+- The space you chose to leave free is respected: files that would not fit are
+  skipped, so the fallback can leave somewhat more free space than requested.
 
 This is only triggered when the primary method wrote nothing; you are always
 prompted before anything is downloaded.
@@ -176,11 +185,15 @@ interface.
   add a book later you can **delete a single file to free 100 MB** and copy it in,
   while the device stays full enough to keep OTA updates blocked — no need to remove
   everything.
-- Multiple runs are safe — continues from where it left off
+- Multiple runs are safe — existing filler files are kept and the script
+  continues from where it left off, also after you deleted single files
 - To free the space again, run the script and pick **Remove filler files**
   (it reports free space before/after). Deleting `fill_disk/` by hand also works.
 - The script **will not** create files on your PC — it only targets the Kindle device
-- If no Kindle is detected, the script aborts with a clear error message
+- If no Kindle is detected, the script lists the available devices so you can
+  pick one, and aborts with a clear error message if there are none
+- Linux/macOS, mass storage: wait for the "Flushing data to the device" step to
+  finish before unplugging the Kindle
 
 ## Running from File (Windows)
 
@@ -210,12 +223,21 @@ This issue was fixed in v2.1. The script now detects the Kindle device before cr
 ### "El archivo no está firmado digitalmente" (Windows)
 See [Running from File](#running-from-file-windows) above.
 
+### "Fill stopped early"
+The summary says this when a write failed before the target was reached. The
+error is printed just above the summary (device full, disconnected, locked or
+read-only). Reconnect the Kindle and run the script again; it resumes.
+
 ### MTP is slow
-MTP transfers are inherently slower than mass storage. The script writes 100MB files in both modes (with a 50/10/1MB tail); on MTP each file is streamed one at a time, which balances speed and reliability.
+MTP transfers are inherently slower than mass storage. The script writes 100MB files in both modes (with a 50/10/1MB tail); on MTP each file is streamed one at a time, which balances speed and reliability. v2.2 reduced the waiting between files, but the transfer itself is limited by the device.
 
 ## Manual
 
 Copy `Filler.ps1` (Windows) or `Filler.sh` (Linux/macOS) to Kindle root via USB, then run.
+
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md).
 
 ## Credits
 
