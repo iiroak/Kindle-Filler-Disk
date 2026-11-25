@@ -11,6 +11,8 @@
 # - macOS (mass storage only, no MTP support)
 
 set -e
+# When run via "curl ... | bash", stdin is the script itself, so prompts must read from the terminal
+[ -z "${BASH_SOURCE[0]}" ] && read() { if [ "$1" = -p ]; then builtin read "$@" </dev/tty; else builtin read "$@"; fi; }
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 TEMP_DIR=""
